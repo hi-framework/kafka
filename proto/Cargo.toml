@@ -1,0 +1,11 @@
+[package]
+name = "hi-kafka-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hi-Kafka IPC protocol v1: frame codec and message types"
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
