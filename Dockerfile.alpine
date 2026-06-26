@@ -1,0 +1,222 @@
+# Alpine 多阶段构建：musl libc 全链路，最终镜像 < 100 MB。
+#
+# 与默认 Debian 镜像（`Dockerfile`）等价的产物：
+#   /usr/lib/php/extensions/hi_kafka.so
+#   /usr/local/etc/php/conf.d/hi_kafka.ini
+#
+# 用法（默认走 USTC 镜像加速 apk / rustup / crates.io）：
+#   docker build -f Dockerfile.alpine --build-arg PHP_VERSION=8.3 \
+#       -t hi-kafka:php8.3-alpine .
+#
+# 关掉镜像走官方源（境外环境）：
+#   docker build -f Dockerfile.alpine \
+#       --build-arg APK_MIRROR= \
+#       --build-arg RUSTUP_DIST_SERVER=https://static.rust-lang.org \
+#       --build-arg RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup \
+#       --build-arg CRATES_INDEX= \
+#       -t hi-kafka:php8.3-alpine .
+#
+# 跨架构：
+#   docker buildx build -f Dockerfile.alpine --platform linux/amd64,linux/arm64 \
+#       --build-arg PHP_VERSION=8.3 -t hi-kafka:php8.3-alpine .
+#
+# Alpine vs Debian 关键差异：
+#   - musl libc 替代 glibc（Rust 自动选 musl target，无需 `--target` 标志）
+#   - 不再装 librdkafka 包（vendor 构建）；只装 SASL/libz 这种 ABI 稳的 runtime lib
+#   - 镜像大小 ~80 MB vs Debian ~180 MB
+#
+# 兼容性：
+#   - libc::prctl 被 #[cfg(target_os = "linux")] 守护，musl 也实现了 PR_SET_NAME
+#   - libc::fork/setsid/signal —— POSIX 通用
+#   - librdkafka 行为：与 Debian 镜像**字节级一致**（同一 rdkafka-sys vendored 版本）
+#
+# ============================================================================
+# 升级 Alpine 版本（ALPINE_VARIANT）前的稳定性 checklist：
+# ============================================================================
+# 1. 检查目标 Alpine 版本的 LLVM 主版本：
+#       docker run --rm alpine:VERSION sh -c 'apk info clang | grep version'
+#    若 LLVM ≥ 19，必须确认 rdkafka-sys 用的 bindgen 版本：
+#       cargo update --dry-run -p bindgen
+#    bindgen 0.71+ 才支持 LLVM 19+；老版本会出现「Dynamic loading not supported」
+#    （即本 Dockerfile 当初为何 pin 在 alpine3.20 / LLVM 17 的根因）。
+#
+# 2. librdkafka 版本不再由 Alpine 包决定 —— 走 rdkafka-sys 的 vendored 构建，
+#    版本随 worker/Cargo.toml 的 `rdkafka = "0.38"` 锁定。要换 librdkafka 版本：
+#       cargo update -p rdkafka-sys
+#    上线前在 staging 跑完整 e2e 验证事务/EOS/OAuth 行为不变。
+#
+# 3. 升级前必须在 staging 跑完整 e2e，特别是涉及事务和 OAuth 的：
+#       tests/php/transaction.php
+#       tests/php/consumer-in-txn.php
+#       tests/php/oauth-smoke.php
+#       tests/php/rebalance.php
+#
+# 4. 镜像 rollout 用蓝绿或 canary：先 1% 流量观察 24h（rdkafka 客户端的事务
+#    协议行为对 librdkafka 版本敏感），无回滚则全量。
+
+ARG PHP_VERSION=8.3
+ARG RUST_VERSION=1.85
+# Alpine 版本：pin 在 3.20（LLVM 18），更高版本（3.22+ → LLVM 22）会让
+# rdkafka-sys 用的 bindgen 0.68 跑 libclang 失败：「Dynamic loading not supported」。
+# 升 bindgen 需上游 rdkafka 跟进，目前 pin Alpine 是稳态。
+ARG ALPINE_VARIANT=alpine3.20
+
+# 国内镜像加速（USTC）。设为空字符串则走默认源。
+# - apk 源：dl-cdn.alpinelinux.org → mirrors.ustc.edu.cn
+# - rustup：static.rust-lang.org → mirrors.ustc.edu.cn/rust-static
+# - crates.io：sparse+https://mirrors.ustc.edu.cn/crates.io-index/
+ARG APK_MIRROR=mirrors.ustc.edu.cn
+ARG RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
+ARG RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
+ARG CRATES_INDEX=sparse+https://mirrors.ustc.edu.cn/crates.io-index/
+
+# ============================================================================
+# Stage 1: builder
+# ============================================================================
+FROM php:${PHP_VERSION}-cli-${ALPINE_VARIANT} AS builder
+
+ARG RUST_VERSION
+ARG APK_MIRROR
+ARG RUSTUP_DIST_SERVER
+ARG RUSTUP_UPDATE_ROOT
+ARG CRATES_INDEX
+
+# 切 apk 源到 USTC（如指定）。空字符串则走默认源。
+RUN if [ -n "${APK_MIRROR}" ]; then \
+        sed -i "s|dl-cdn.alpinelinux.org|${APK_MIRROR}|g" /etc/apk/repositories \
+        && echo "==> apk source: $(head -2 /etc/apk/repositories)"; \
+    fi
+
+# Alpine 构建依赖（vendored librdkafka + OpenSSL 模式）
+# - build-base / musl-dev / linux-headers：C/C++ 编译 + 系统头
+# - bash：rdkafka-sys vendored configure 脚本必需（Alpine 默认 sh 不够）
+# - perl：vendored OpenSSL 的 Configure 脚本必需
+# - cmake：rdkafka/cmake-build feature 走 CMake 链路
+# - cyrus-sasl-dev：rdkafka/sasl 需要 -lsasl2 + 头文件
+# - zlib-dev：rdkafka/libz 需要 -lz + 头文件
+# - curl-dev：rdkafka/curl 需要 curl/curl.h（librdkafka 2.12 OAUTHBEARER OIDC 强制依赖）
+# - clang clang-dev：bindgen 生成 rdkafka-sys 绑定
+# - curl ca-certificates：装 rustup（注：curl 命令本身，不是 -dev 头）
+# - git：cargo 拉 git 依赖（如果有）
+#
+# 不再装 librdkafka / openssl-dev —— vendor 模式不读它们。
+RUN apk add --no-cache \
+        build-base \
+        musl-dev \
+        linux-headers \
+        bash \
+        perl \
+        cmake \
+        cyrus-sasl-dev \
+        zlib-dev \
+        curl-dev \
+        clang \
+        clang-dev \
+        pkgconf \
+        curl \
+        git \
+        ca-certificates
+
+# Rust 工具链（默认就装 musl host，无需 `rustup target add`）。
+# RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT 让 rustup 从 USTC 拉。
+#
+# **关键 ENV：`RUSTFLAGS=-C target-feature=-crt-static`**
+# rustup 在 musl host 默认 *static crt* —— build.rs 出来是 fully-static ELF，
+# 那个 musl 的 `dlopen()` 是个返回 ENOSYS 的 stub，bindgen 调 libloading 时
+# 会撞「Dynamic loading not supported」（即本错误信息的根因）。
+# 关掉 static crt 让 rustc 产 PIE + 动态链 musl libc.so，dlopen 才走得通。
+# librdkafka / OpenSSL 仍然 vendor 进 cdylib，static crt 不是 vendor 的前提，
+# 我们只要 libc 这一层动态即可。
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
+    RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT} \
+    RUSTFLAGS="-C target-feature=-crt-static" \
+    LIBCLANG_PATH=/usr/lib/llvm17/lib \
+    BINDGEN_EXTRA_CLANG_ARGS="--sysroot=/"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path \
+    && rustup --version && cargo --version && rustc --version
+
+# 把 crates.io registry 指向 USTC sparse 索引（拉 crate 元数据 + tarball 都从镜像走）
+RUN if [ -n "${CRATES_INDEX}" ]; then \
+        mkdir -p ${CARGO_HOME} \
+        && printf '[source.crates-io]\nreplace-with = "ustc"\n\n[source.ustc]\nregistry = "%s"\n' "${CRATES_INDEX}" \
+            > ${CARGO_HOME}/config.toml \
+        && echo "==> cargo source:" && cat ${CARGO_HOME}/config.toml; \
+    fi
+
+WORKDIR /src
+
+# 利用 docker 层缓存：先 manifest，预拉依赖
+COPY Cargo.toml Cargo.lock ./
+COPY proto/Cargo.toml ./proto/
+COPY worker/Cargo.toml ./worker/
+COPY ext/Cargo.toml ./ext/
+COPY rust-toolchain.toml ./
+RUN mkdir -p proto/src worker/src ext/src \
+    && echo 'pub fn _stub() {}' > proto/src/lib.rs \
+    && echo 'pub fn _stub() {}' > worker/src/lib.rs \
+    && echo 'fn main() {}' > worker/src/main.rs \
+    && echo 'pub fn _stub() {}' > ext/src/lib.rs \
+    && cargo build --workspace --release --features hi-kafka-worker/kafka-vendored-tls 2>/dev/null || true
+
+# 真实源码
+COPY proto ./proto
+COPY worker ./worker
+COPY ext ./ext
+
+# Alpine 上 ext-php-rs 链 PHP 符号：cdylib 的 undefined symbol 默认允许
+# （Linux ld 行为），运行时由 PHP dlopen 解析。
+RUN touch proto/src/lib.rs worker/src/lib.rs worker/src/main.rs ext/src/lib.rs \
+    && cargo build -p hi-kafka --release --features kafka-vendored-tls
+
+# 稳态校验：.so 不应当 NEEDED librdkafka / libssl / libcrypto（全部 vendored 进来）
+RUN file /src/target/release/libhi_kafka.so \
+    && echo "==> readelf NEEDED:" \
+    && readelf -d /src/target/release/libhi_kafka.so | grep NEEDED \
+    && ! (readelf -d /src/target/release/libhi_kafka.so | grep -E "NEEDED.*(librdkafka|libssl|libcrypto)") \
+    && echo "==> ✓ no librdkafka/libssl/libcrypto runtime dependency"
+
+# ============================================================================
+# Stage 2: runtime
+# ============================================================================
+FROM php:${PHP_VERSION}-cli-${ALPINE_VARIANT} AS runtime
+
+ARG APK_MIRROR
+
+# 运行时只需 libsasl + libz + libcurl + libgcc（其它全部 vendor 进 .so）
+# - libgcc：vendored librdkafka 里的 C++ 代码做 stack unwind 必需 libgcc_s.so.1，
+#   Alpine 默认 musl 镜像不带，需要显式装
+# - libstdc++：rdkafka 大部分 C 实现，但 cmake-build vendored librdkafka 会带 C++ 部分（如 zstd C++ stub），稳妥起见加上
+RUN if [ -n "${APK_MIRROR}" ]; then \
+        sed -i "s|dl-cdn.alpinelinux.org|${APK_MIRROR}|g" /etc/apk/repositories; \
+    fi \
+    && apk add --no-cache \
+        libsasl \
+        zlib \
+        libcurl \
+        libgcc \
+        libstdc++ \
+        ca-certificates
+
+ARG EXT_DIR=/usr/lib/php/extensions
+RUN mkdir -p ${EXT_DIR}
+
+# 单 .so —— worker 代码已经链接进来，无需单独二进制
+COPY --from=builder /src/target/release/libhi_kafka.so ${EXT_DIR}/hi_kafka.so
+
+# 激活扩展
+RUN echo "extension=${EXT_DIR}/hi_kafka.so" > /usr/local/etc/php/conf.d/hi_kafka.ini
+
+# PHP driver 文件（Hi\Kafka\SwooleClient / SwowClient 等）
+COPY php-driver/src /opt/hi-kafka/php-driver/src
+
+# 测试脚本（CI 集成测试用）
+COPY tests/php /opt/hi-kafka/tests/php
+
+LABEL org.opencontainers.image.title="hi-kafka" \
+      org.opencontainers.image.description="PHP Kafka extension with embedded Rust worker (Alpine/musl, vendored librdkafka + OpenSSL)"
+
+CMD ["php", "-m"]

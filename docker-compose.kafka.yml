@@ -1,0 +1,57 @@
+# 本地开发用单节点 Kafka（KRaft 模式，无 ZooKeeper）。
+#
+# 用法：
+#   docker compose -f docker-compose.kafka.yml up -d
+#   docker compose -f docker-compose.kafka.yml down -v
+#
+# 验证：
+#   docker exec hi-kafka-ext-kafka_kraft-1 \
+#       /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+#
+# 镜像源：
+#   默认走 apache/kafka:3.8.0 官方 multi-arch 镜像（amd64/arm64 都有）——
+#   旧版 bitnami/kafka 在 2024 年起逐步从 Docker Hub 下线，不再可拉。
+#   想走 mirror 加速：
+#     KAFKA_IMAGE=registry.example.com/apache/kafka:3.8.0 \
+#       docker compose -f docker-compose.kafka.yml up -d
+#
+# 监听器拓扑：
+#   - PLAINTEXT  :9092  容器网络内 broker ↔ broker / broker ↔ kafka-ui 用
+#   - CONTROLLER :9093  KRaft 内部仲裁
+#   - EXTERNAL   :9094  宿主上的客户端（PHP 测试 / 业务）用
+#   EXTERNAL 通告地址为 127.0.0.1 是为了让 GitHub Actions Linux runner
+#   和 macOS Docker Desktop 上的 host PHP 都能直连——host.docker.internal
+#   在 Linux Docker 默认不解析，会导致 CI integration job 失败。
+services:
+  kafka_kraft:
+    image: ${KAFKA_IMAGE:-apache/kafka:3.8.0}
+    hostname: kafka_kraft
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      # KRaft
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      # 三个监听器
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka_kraft:9092,EXTERNAL://127.0.0.1:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # 单节点必备：内部 topic 副本因子降到 1，否则 broker 永远卡在创建
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # 业务
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 1
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - 8080:8080
+    environment:
+      DYNAMIC_CONFIG_ENABLED: true
+      # 容器内 kafka-ui 走 PLAINTEXT 内部 listener，不走 host.docker.internal
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka_kraft:9092
