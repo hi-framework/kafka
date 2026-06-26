@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["ext", "worker", "proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/hi/framework"
+authors = ["Hi Framework Team"]
+
+[workspace.dependencies]
+hi-kafka-proto = { path = "proto" }
+
+anyhow = "1.0"
+thiserror = "2.0"
+bytes = "1.7"
+tokio = { version = "1.40", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
