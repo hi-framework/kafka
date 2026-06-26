@@ -1,0 +1,795 @@
+use crate::cluster::{ClusterRegistryHandle, StoredOAuthToken};
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
+use crate::consumer::{ConsumerHandle, SubscriptionId};
+use crate::metrics::Metrics;
+use crate::producer::ProducerHandle;
+use crate::shutdown::ShutdownHandle;
+use anyhow::Context;
+use bytes::BytesMut;
+use hi_kafka_proto::{
+    CommitReq, CommitResp, DeliveryErr, FrameType, HEADER_LEN, PauseResumeOp, PauseResumeReq,
+    PauseResumeResp, PollRebalanceReq, PollRebalanceResp, PollReq, PollResp, ProduceFnf,
+    ProduceReq, ProduceResp, RegisterClusterReq, RegisterClusterResp, SeekReq, SeekResp,
+    SendOffsetsReq, SendOffsetsResp, SetOAuthBearerTokenReq, SetOAuthBearerTokenResp, SubscribeReq,
+    SubscribeResp, TxnOp, TxnReq, TxnResp, UnsubscribeReq, codec, encode_frame,
+};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::task::JoinSet;
+use tracing::{debug, error, info, warn};
+
+pub struct Server {
+    listener: UnixListener,
+    producer: ProducerHandle,
+    consumer: ConsumerHandle,
+    registry: ClusterRegistryHandle,
+    shutdown: ShutdownHandle,
+    metrics: Arc<Metrics>,
+}
+
+impl Server {
+    pub async fn bind(socket: &Path) -> anyhow::Result<Self> {
+        let registry = crate::cluster::ClusterRegistry::new();
+        Self::bind_with(
+            socket,
+            crate::producer::logging(),
+            crate::consumer::logging(),
+            registry,
+            crate::shutdown::ShutdownState::new(),
+            Metrics::new(),
+        )
+        .await
+    }
+
+    pub async fn bind_with(
+        socket: &Path,
+        producer: ProducerHandle,
+        consumer: ConsumerHandle,
+        registry: ClusterRegistryHandle,
+        shutdown: ShutdownHandle,
+        metrics: Arc<Metrics>,
+    ) -> anyhow::Result<Self> {
+        if socket.exists() {
+            std::fs::remove_file(socket).context("remove stale socket")?;
+        }
+        if let Some(parent) = socket.parent() {
+            std::fs::create_dir_all(parent).context("create socket parent dir")?;
+        }
+        let listener = UnixListener::bind(socket).context("bind unix listener")?;
+        info!(socket = %socket.display(), "listening");
+        Ok(Self {
+            listener,
+            producer,
+            consumer,
+            registry,
+            shutdown,
+            metrics,
+        })
+    }
+
+    /// 主循环：accept → spawn connection task。task 句柄进 [`JoinSet`]，
+    /// `drain_timeout` 决定 SIGTERM 后等已 ack 但尚未写回响应的连接的最大时间。
+    ///
+    /// 修复 P0 #1：原实现的 `tokio::select!{ server.run() vs signal }` 在
+    /// 信号到来时直接 drop server future，detach 的 connection task 在 main
+    /// 返回后被 runtime abort，导致已 ack 但未 PRODUCE_RESP 的 cid 永久丢失。
+    /// 现在改为：信号方通过 `shutdown` 通知，server.run 自己 drain，等所有
+    /// in-flight connection 把响应写回（超时强制 abort）才返回。
+    pub async fn run(self, drain_timeout: Duration) -> anyhow::Result<()> {
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = self.shutdown.wait_draining() => {
+                    info!(
+                        in_flight = tasks.len(),
+                        ?drain_timeout,
+                        "server: drain signaled, waiting for in-flight connection tasks"
+                    );
+                    drain_tasks(&mut tasks, drain_timeout).await;
+                    info!("server: drain complete");
+                    return Ok(());
+                }
+                res = self.listener.accept() => {
+                    match res {
+                        Ok((stream, _addr)) => {
+                            debug!("client connected");
+                            Metrics::inc(&self.metrics.ipc_connections_total);
+                            let producer = self.producer.clone();
+                            let consumer = self.consumer.clone();
+                            let registry = self.registry.clone();
+                            let shutdown = self.shutdown.clone();
+                            let metrics = self.metrics.clone();
+                            tasks.spawn(async move {
+                                if let Err(e) = handle_connection(stream, producer, consumer, registry, shutdown, metrics).await {
+                                    warn!(error = ?e, "connection ended with error");
+                                }
+                            });
+                            // 机会主义清理已结束的 task，避免 JoinSet 无限增长
+                            reap_finished(&mut tasks);
+                        }
+                        Err(e) => {
+                            error!(error = ?e, "accept failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// drain：等所有 in-flight connection task 自然结束，超时则全部 abort
+/// 避免 SIGTERM 之后 hi-kafka 客户端永远等不到已 ack 的 PRODUCE_RESP
+async fn drain_tasks(tasks: &mut JoinSet<()>, drain_timeout: Duration) {
+    if tasks.is_empty() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(res)) => {
+                if let Err(e) = res {
+                    warn!(error = ?e, "connection task error during drain");
+                }
+            }
+            Ok(None) => return, // 全部结束
+            Err(_) => {
+                warn!(
+                    remaining = tasks.len(),
+                    "drain timeout reached, aborting remaining connection tasks"
+                );
+                tasks.abort_all();
+                // 等 abort 真正完成（一般立即）
+                while tasks.join_next().await.is_some() {}
+                return;
+            }
+        }
+    }
+}
+
+/// P3 #8：按帧类型做"业务期望"的 payload 上限。比协议级 MAX_PAYLOAD_LEN
+/// 严格，避免 16 MiB × N 连接 OOM。返回 `Err` 则连接立即关。
+fn check_per_frame_limit(kind: FrameType, payload_len: u32) -> anyhow::Result<()> {
+    // 单条业务消息（key + value + headers）上限：4 MiB
+    // ——Kafka broker 默认 message.max.bytes 1 MiB，留 4× 余量给 headers / 大 value
+    const PRODUCE_MAX: u32 = 4 * 1024 * 1024;
+    // poll 一批消息回 PHP：上限 8 MiB（多条聚合）
+    const POLL_RESP_MAX: u32 = 8 * 1024 * 1024;
+    // 控制帧（注册集群、订阅、提交、事务、OAuth token 等）：64 KiB 足矣
+    const CONTROL_MAX: u32 = 64 * 1024;
+
+    let limit = match kind {
+        FrameType::ProduceFnf | FrameType::ProduceReq | FrameType::ProduceResp => PRODUCE_MAX,
+        FrameType::PollResp => POLL_RESP_MAX,
+        // 其余全部按控制帧
+        _ => CONTROL_MAX,
+    };
+    if payload_len > limit {
+        anyhow::bail!(
+            "frame payload {} exceeds per-type limit {} for {:?}",
+            payload_len,
+            limit,
+            kind
+        );
+    }
+    Ok(())
+}
+
+/// 机会主义把已结束的 task 从 JoinSet 拿出来；不阻塞。
+fn reap_finished(tasks: &mut JoinSet<()>) {
+    while let Some(res) = tasks.try_join_next() {
+        if let Err(e) = res {
+            warn!(error = ?e, "connection task ended with error");
+        }
+    }
+}
+
+async fn handle_connection(
+    mut stream: UnixStream,
+    producer: ProducerHandle,
+    consumer: ConsumerHandle,
+    registry: ClusterRegistryHandle,
+    shutdown: ShutdownHandle,
+    metrics: Arc<Metrics>,
+) -> anyhow::Result<()> {
+    let mut header_buf = [0u8; HEADER_LEN];
+    let mut payload_buf = BytesMut::new();
+
+    loop {
+        if let Err(e) = stream.read_exact(&mut header_buf).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                debug!("client disconnected");
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+
+        let header = codec::decode_header(&header_buf).context("decode header")?;
+        Metrics::inc(&metrics.ipc_frames_total);
+        // P3 #8：codec::decode_header 已检 MAX_PAYLOAD_LEN（16 MiB 协议级硬上限）。
+        // 这里再按 frame 类型加一层"实际业务上限"，让恶意/错配的客户端无法
+        // 在没有恶意单帧的前提下 16 MiB × N 个连接打爆 worker 内存。
+        // 业务侧 ProduceReq 消息单条 > 4 MiB 是反模式（Kafka 默认 message.max.bytes 1 MiB），
+        // RegisterCluster/OAuth token 等控制帧更应该几 KiB 就够。
+        if let Err(e) = check_per_frame_limit(header.kind, header.payload_len) {
+            warn!(cid = header.cid, kind = ?header.kind, payload_len = header.payload_len,
+                  "rejecting oversized frame: {e}");
+            // 把后续字节读掉以保持 stream 对齐，然后 return Err 让 connection close
+            let mut sink = vec![0u8; header.payload_len as usize];
+            let _ = stream.read_exact(&mut sink).await;
+            return Err(e);
+        }
+        payload_buf.clear();
+        payload_buf.resize(header.payload_len as usize, 0);
+        stream.read_exact(&mut payload_buf).await.context("read payload")?;
+
+        dispatch(
+            &mut stream,
+            header.kind,
+            header.cid,
+            &payload_buf,
+            &producer,
+            &consumer,
+            &registry,
+            &shutdown,
+            &metrics,
+        )
+        .await?;
+    }
+}
+
+async fn dispatch(
+    stream: &mut UnixStream,
+    kind: FrameType,
+    cid: u64,
+    payload: &[u8],
+    producer: &ProducerHandle,
+    consumer: &ConsumerHandle,
+    registry: &ClusterRegistryHandle,
+    shutdown: &ShutdownHandle,
+    metrics: &Arc<Metrics>,
+) -> anyhow::Result<()> {
+    match kind {
+        FrameType::Hello => {
+            info!(cid, payload_len = payload.len(), "HELLO received");
+        }
+        FrameType::Ping => {
+            debug!(cid, "PING received");
+            write_frame(stream, FrameType::Pong, cid, &[]).await?;
+        }
+        FrameType::ProduceFnf => {
+            Metrics::inc(&metrics.produce_fnf_total);
+            if shutdown.is_draining() {
+                Metrics::inc(&metrics.frames_dropped_draining_total);
+                warn!(cid, "PRODUCE_FNF dropped: worker draining");
+                return Ok(());
+            }
+            match ProduceFnf::decode(payload) {
+                Ok(msg) => {
+                    let cluster = msg.cluster.clone();
+                    let topic = msg.topic.clone();
+                    if let Err(e) = producer.produce_fnf(msg).await {
+                        Metrics::inc(&metrics.produce_fnf_failed_total);
+                        warn!(cid, %cluster, %topic, error = ?e, "PRODUCE_FNF failed");
+                    }
+                }
+                Err(e) => {
+                    Metrics::inc(&metrics.produce_fnf_failed_total);
+                    warn!(cid, error = ?e, "PRODUCE_FNF payload decode failed");
+                }
+            }
+        }
+        FrameType::ProduceReq => {
+            Metrics::inc(&metrics.produce_req_total);
+            if shutdown.is_draining() {
+                Metrics::inc(&metrics.frames_dropped_draining_total);
+                Metrics::inc(&metrics.produce_resp_err_total);
+                let resp = ProduceResp::Err(DeliveryErr {
+                    code: u16::MAX,
+                    message: "worker is draining".into(),
+                    retryable: true,
+                });
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf).context("encode shutdown resp")?;
+                write_frame(stream, FrameType::ProduceResp, cid, &buf).await?;
+                return Ok(());
+            }
+            handle_produce_req(stream, cid, payload, producer, metrics).await?;
+        }
+        FrameType::SubscribeReq => {
+            handle_subscribe(stream, cid, payload, consumer).await?;
+        }
+        FrameType::PollReq => {
+            handle_poll(stream, cid, payload, consumer).await?;
+        }
+        FrameType::CommitReq => {
+            handle_commit(stream, cid, payload, consumer).await?;
+        }
+        FrameType::Unsubscribe => {
+            handle_unsubscribe(cid, payload, consumer).await;
+        }
+        FrameType::RegisterClusterReq => {
+            handle_register_cluster(stream, cid, payload, registry).await?;
+        }
+        FrameType::TxnReq => {
+            handle_txn(stream, cid, payload, producer).await?;
+        }
+        FrameType::PollRebalanceReq => {
+            handle_poll_rebalance(stream, cid, payload, consumer).await?;
+        }
+        FrameType::SeekReq => {
+            handle_seek(stream, cid, payload, consumer).await?;
+        }
+        FrameType::SendOffsetsReq => {
+            handle_send_offsets(stream, cid, payload, producer, consumer).await?;
+        }
+        FrameType::PauseResumeReq => {
+            handle_pause_resume(stream, cid, payload, consumer).await?;
+        }
+        FrameType::SetOAuthBearerTokenReq => {
+            handle_set_oauth_token(stream, cid, payload, registry).await?;
+        }
+        other => {
+            warn!(kind = ?other, cid, "frame type not yet implemented");
+        }
+    }
+    Ok(())
+}
+
+async fn handle_subscribe(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    consumer: &ConsumerHandle,
+) -> anyhow::Result<()> {
+    let resp = match SubscribeReq::decode(payload) {
+        Ok(req) => match consumer.subscribe(req).await {
+            Ok(sub) => SubscribeResp::Ok {
+                subscription_id: sub.0,
+            },
+            Err(e) => SubscribeResp::Err {
+                message: format!("subscribe: {e}"),
+            },
+        },
+        Err(e) => SubscribeResp::Err {
+            message: format!("payload decode: {e}"),
+        },
+    };
+    let mut buf = BytesMut::new();
+    resp.encode(&mut buf).context("encode subscribe_resp")?;
+    write_frame(stream, FrameType::SubscribeResp, cid, &buf).await
+}
+
+async fn handle_poll(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    consumer: &ConsumerHandle,
+) -> anyhow::Result<()> {
+    let resp = match PollReq::decode(payload) {
+        Ok(req) => {
+            let sub = SubscriptionId(req.subscription_id);
+            match consumer.poll(sub, req.max_messages, req.timeout_ms).await {
+                Ok(messages) => PollResp::Ok { messages },
+                Err(e) => PollResp::Err {
+                    message: format!("poll: {e}"),
+                },
+            }
+        }
+        Err(e) => PollResp::Err {
+            message: format!("payload decode: {e}"),
+        },
+    };
+    let mut buf = BytesMut::new();
+    resp.encode(&mut buf).context("encode poll_resp")?;
+    write_frame(stream, FrameType::PollResp, cid, &buf).await
+}
+
+async fn handle_commit(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    consumer: &ConsumerHandle,
+) -> anyhow::Result<()> {
+    let resp = match CommitReq::decode(payload) {
+        Ok(req) => {
+            let sub = SubscriptionId(req.subscription_id);
+            match consumer.commit(sub).await {
+                Ok(()) => CommitResp::Ok,
+                Err(e) => CommitResp::Err {
+                    message: format!("commit: {e}"),
+                },
+            }
+        }
+        Err(e) => CommitResp::Err {
+            message: format!("payload decode: {e}"),
+        },
+    };
+    let mut buf = BytesMut::new();
+    resp.encode(&mut buf).context("encode commit_resp")?;
+    write_frame(stream, FrameType::CommitResp, cid, &buf).await
+}
+
+async fn handle_seek(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    consumer: &ConsumerHandle,
+) -> anyhow::Result<()> {
+    let resp = match SeekReq::decode(payload) {
+        Ok(req) => {
+            let sub = SubscriptionId(req.subscription_id());
+            let r = match req {
+                SeekReq::ByOffset { targets, .. } => consumer.seek_by_offset(sub, targets).await,
+                SeekReq::ByTimestamp {
+                    timestamp_ms,
+                    partitions,
+                    ..
+                } => {
+                    consumer
+                        .seek_by_timestamp(sub, timestamp_ms, partitions)
+                        .await
+                }
+            };
+            match r {
+                Ok(()) => SeekResp::Ok,
+                Err(e) => SeekResp::Err {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
+        Err(e) => SeekResp::Err {
+            message: format!("payload decode: {e}"),
+        },
+    };
+    let mut buf = BytesMut::new();
+    resp.encode(&mut buf).context("encode seek_resp")?;
+    write_frame(stream, FrameType::SeekResp, cid, &buf).await
+}
+
+async fn handle_poll_rebalance(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    consumer: &ConsumerHandle,
+) -> anyhow::Result<()> {
+    let resp = match PollRebalanceReq::decode(payload) {
+        Ok(req) => {
+            let sub = SubscriptionId(req.subscription_id);
+            match consumer.fetch_rebalance_events(sub, req.max_events).await {
+                Ok(events) => PollRebalanceResp::Ok { events },
+                Err(e) => PollRebalanceResp::Err {
+                    message: format!("fetch_rebalance_events: {e}"),
+                },
+            }
+        }
+        Err(e) => PollRebalanceResp::Err {
+            message: format!("payload decode: {e}"),
+        },
+    };
+    let mut buf = BytesMut::new();
+    resp.encode(&mut buf).context("encode poll_rebalance_resp")?;
+    write_frame(stream, FrameType::PollRebalanceResp, cid, &buf).await
+}
+
+async fn handle_txn(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    producer: &ProducerHandle,
+) -> anyhow::Result<()> {
+    let resp = match TxnReq::decode(payload) {
+        Ok(req) => {
+            let r = match req.op {
+                TxnOp::Begin => producer.begin_transaction(&req.cluster).await,
+                TxnOp::Commit => producer.commit_transaction(&req.cluster).await,
+                TxnOp::Abort => producer.abort_transaction(&req.cluster).await,
+            };
+            match r {
+                Ok(()) => {
+                    info!(cluster = %req.cluster, op = ?req.op, "txn op ok");
+                    TxnResp::Ok
+                }
+                Err(e) => {
+                    warn!(cluster = %req.cluster, op = ?req.op, error = ?e, "txn op failed");
+                    TxnResp::Err {
+                        message: format!("{e:#}"),
+                    }
+                }
+            }
+        }
+        Err(e) => TxnResp::Err {
+            message: format!("payload decode: {e}"),
+        },
+    };
+    let mut buf = BytesMut::new();
+    resp.encode(&mut buf).context("encode txn_resp")?;
+    write_frame(stream, FrameType::TxnResp, cid, &buf).await
+}
+
+async fn handle_set_oauth_token(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    registry: &ClusterRegistryHandle,
+) -> anyhow::Result<()> {
+    let resp = match SetOAuthBearerTokenReq::decode(payload) {
+        Ok(req) => {
+            let token = StoredOAuthToken {
+                token_value: req.token_value,
+                lifetime_ms: req.lifetime_ms,
+                principal_name: req.principal_name,
+                extensions: req.extensions,
+            };
+            match registry.set_oauth_token(&req.cluster, token).await {
+                Ok(()) => {
+                    info!(
+                        cluster = %req.cluster,
+                        lifetime_ms = req.lifetime_ms,
+                        "OAuth token updated"
+                    );
+                    SetOAuthBearerTokenResp::Ok
+                }
+                Err(msg) => {
+                    warn!(cluster = %req.cluster, error = %msg, "set_oauth_token failed");
+                    SetOAuthBearerTokenResp::Err { message: msg }
+                }
+            }
+        }
+        Err(e) => SetOAuthBearerTokenResp::Err {
+            message: format!("payload decode: {e}"),
+        },
+    };
+    let mut buf = BytesMut::new();
+    resp.encode(&mut buf)
+        .context("encode set_oauth_token_resp")?;
+    write_frame(stream, FrameType::SetOAuthBearerTokenResp, cid, &buf).await
+}
+
+async fn handle_pause_resume(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    consumer: &ConsumerHandle,
+) -> anyhow::Result<()> {
+    let resp = match PauseResumeReq::decode(payload) {
+        Ok(req) => {
+            let sub = SubscriptionId(req.subscription_id);
+            let count = req.partitions.len();
+            let r = match req.op {
+                PauseResumeOp::Pause => consumer.pause(sub, req.partitions).await,
+                PauseResumeOp::Resume => consumer.resume(sub, req.partitions).await,
+            };
+            match r {
+                Ok(()) => {
+                    debug!(?sub, op = ?req.op, count, "pause/resume ok");
+                    PauseResumeResp::Ok
+                }
+                Err(e) => {
+                    warn!(?sub, op = ?req.op, error = ?e, "pause/resume failed");
+                    PauseResumeResp::Err {
+                        message: format!("{e:#}"),
+                    }
+                }
+            }
+        }
+        Err(e) => PauseResumeResp::Err {
+            message: format!("payload decode: {e}"),
+        },
+    };
+    let mut buf = BytesMut::new();
+    resp.encode(&mut buf).context("encode pause_resume_resp")?;
+    write_frame(stream, FrameType::PauseResumeResp, cid, &buf).await
+}
+
+async fn handle_send_offsets(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    producer: &ProducerHandle,
+    consumer: &ConsumerHandle,
+) -> anyhow::Result<()> {
+    let resp = match SendOffsetsReq::decode(payload) {
+        Ok(req) => {
+            let sub = SubscriptionId(req.subscription_id);
+            // 1) 拿 group_metadata
+            match consumer.group_metadata(sub).await {
+                Ok(metadata) => {
+                    // 2) 调 producer 把 offsets 提交进当前事务
+                    match producer
+                        .send_offsets_to_transaction(
+                            &req.producer_cluster,
+                            &req.group_id,
+                            req.offsets,
+                            metadata,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            info!(
+                                cluster = %req.producer_cluster,
+                                group_id = %req.group_id,
+                                ?sub,
+                                "send_offsets_to_transaction ok"
+                            );
+                            SendOffsetsResp::Ok
+                        }
+                        Err(e) => {
+                            warn!(
+                                cluster = %req.producer_cluster,
+                                group_id = %req.group_id,
+                                ?sub,
+                                error = ?e,
+                                "send_offsets_to_transaction failed"
+                            );
+                            SendOffsetsResp::Err {
+                                message: format!("{e:#}"),
+                            }
+                        }
+                    }
+                }
+                Err(e) => SendOffsetsResp::Err {
+                    message: format!("group_metadata: {e}"),
+                },
+            }
+        }
+        Err(e) => SendOffsetsResp::Err {
+            message: format!("payload decode: {e}"),
+        },
+    };
+    let mut buf = BytesMut::new();
+    resp.encode(&mut buf).context("encode send_offsets_resp")?;
+    write_frame(stream, FrameType::SendOffsetsResp, cid, &buf).await
+}
+
+async fn handle_register_cluster(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    registry: &ClusterRegistryHandle,
+) -> anyhow::Result<()> {
+    let resp = match RegisterClusterReq::decode(payload) {
+        Ok(req) => {
+            let cluster = req.cluster.clone();
+            let config: std::collections::HashMap<_, _> = req.config.into_iter().collect();
+            if !config.contains_key("bootstrap.servers") {
+                RegisterClusterResp::Err {
+                    message: format!("cluster '{cluster}': missing required key 'bootstrap.servers'"),
+                }
+            } else {
+                let added = registry.register(cluster.clone(), config).await;
+                info!(%cluster, added, "cluster registered");
+                RegisterClusterResp::Ok
+            }
+        }
+        Err(e) => RegisterClusterResp::Err {
+            message: format!("payload decode: {e}"),
+        },
+    };
+    let mut buf = BytesMut::new();
+    resp.encode(&mut buf).context("encode register_cluster_resp")?;
+    write_frame(stream, FrameType::RegisterClusterResp, cid, &buf).await
+}
+
+async fn handle_unsubscribe(cid: u64, payload: &[u8], consumer: &ConsumerHandle) {
+    match UnsubscribeReq::decode(payload) {
+        Ok(req) => {
+            let sub = SubscriptionId(req.subscription_id);
+            if let Err(e) = consumer.unsubscribe(sub).await {
+                warn!(cid, ?sub, error = ?e, "unsubscribe failed");
+            }
+        }
+        Err(e) => {
+            warn!(cid, error = ?e, "unsubscribe payload decode failed");
+        }
+    }
+}
+
+/// P2 #9：panic guard 包裹 produce_ack + encode + write_frame。
+///
+/// 真实风险：produce_ack 已 ack broker（消息已 commit）后，在 encode/write 之间
+/// 发生 panic → connection drop → PHP 客户端 EOF → 重试 → 重复 produce。
+/// 我们 catch panic 后**尽力**写一个 server-error frame（retryable=true 让客户端
+/// 重试，配合 librdkafka enable.idempotence=true 可去重）；
+/// 写 frame 本身也可能 panic，那只能让客户端见 EOF 然后重试，
+/// 至少日志里留下了完整 panic backtrace 便于事后定位。
+async fn handle_produce_req(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    producer: &ProducerHandle,
+    metrics: &Arc<Metrics>,
+) -> anyhow::Result<()> {
+    let result = AssertUnwindSafe(handle_produce_req_inner(
+        stream, cid, payload, producer, metrics,
+    ))
+    .catch_unwind()
+    .await;
+    match result {
+        Ok(r) => r,
+        Err(panic) => {
+            let msg = describe_panic(&panic);
+            error!(cid, panic = %msg, "handle_produce_req panicked, attempting fallback error frame");
+            Metrics::inc(&metrics.produce_resp_err_total);
+            let err_resp = ProduceResp::Err(DeliveryErr {
+                code: u16::MAX,
+                message: format!("server panic: {msg}"),
+                retryable: true, // 可重试 + 配合 idempotence 安全去重
+            });
+            let mut buf = BytesMut::new();
+            if err_resp.encode(&mut buf).is_ok() {
+                let _ = write_frame(stream, FrameType::ProduceResp, cid, &buf).await;
+            }
+            Err(anyhow::anyhow!("panic in handle_produce_req: {msg}"))
+        }
+    }
+}
+
+fn describe_panic(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+async fn handle_produce_req_inner(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    producer: &ProducerHandle,
+    metrics: &Arc<Metrics>,
+) -> anyhow::Result<()> {
+    let resp = match ProduceReq::decode(payload) {
+        Ok(msg) => {
+            debug!(cid, cluster = %msg.cluster, topic = %msg.topic, "PRODUCE_REQ received");
+            match producer.produce_ack(msg).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(cid, error = ?e, "produce_ack internal error");
+                    ProduceResp::Err(DeliveryErr {
+                        code: u16::MAX,
+                        message: format!("worker: {e}"),
+                        retryable: false,
+                    })
+                }
+            }
+        }
+        Err(e) => {
+            warn!(cid, error = ?e, "PRODUCE_REQ payload decode failed");
+            ProduceResp::Err(DeliveryErr {
+                code: u16::MAX,
+                message: format!("payload decode: {e}"),
+                retryable: false,
+            })
+        }
+    };
+
+    match &resp {
+        ProduceResp::Ok(_) => Metrics::inc(&metrics.produce_resp_ok_total),
+        ProduceResp::Err(_) => Metrics::inc(&metrics.produce_resp_err_total),
+    }
+
+    let mut resp_payload = BytesMut::new();
+    resp.encode(&mut resp_payload)
+        .context("encode PRODUCE_RESP")?;
+    write_frame(stream, FrameType::ProduceResp, cid, &resp_payload).await
+}
+
+async fn write_frame(
+    stream: &mut UnixStream,
+    kind: FrameType,
+    cid: u64,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let mut buf = BytesMut::new();
+    encode_frame(kind, cid, payload, &mut buf).context("encode frame")?;
+    stream.write_all(&buf).await.context("write frame")?;
+    stream.flush().await.context("flush frame")?;
+    Ok(())
+}

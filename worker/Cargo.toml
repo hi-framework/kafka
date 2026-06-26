@@ -1,0 +1,52 @@
+[package]
+name = "hi-kafka-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hi-Kafka node-local worker daemon"
+
+[lib]
+name = "hi_kafka_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hi-kafka-worker"
+path = "src/main.rs"
+
+[features]
+default = []
+# 开发态 / 本地裸 Kafka 用。rdkafka-sys vendor librdkafka 静态编译，但不带 SSL/SASL。
+# 装 librdkafka 包就跑（macOS 裸机也行）。
+# 不能连云上 OAUTHBEARER / SCRAM / TLS broker。
+kafka = ["dep:rdkafka", "dep:tokio-stream", "dep:dashmap"]
+# 生产**唯一推荐**：vendor librdkafka + vendor OpenSSL。
+# - 云 Kafka 必需的 SSL + SASL/OAUTHBEARER 全部内建到 .so，不看运行时 openssl 版本
+# - 仅 libsasl2 / libz 链系统包（ABI 几十年稳），避开 OpenSSL 1.0→1.1→3.0 ABI break
+# - 编译时额外要：perl（OpenSSL Configure）、bash（vendored librdkafka configure）、cmake
+# - 同一 commit 在 Debian / Alpine / macOS 出的 .so 行为字节级一致
+kafka-vendored-tls = [
+    "kafka",
+    "rdkafka/ssl-vendored",   # vendor OpenSSL，运行时 .so 自带
+    "rdkafka/cmake-build",    # cmake 构建链更稳，跨平台一致
+    "rdkafka/sasl",           # 链系统 libsasl2（Cyrus SASL，ABI 稳）
+    "rdkafka/libz",           # 链系统 libz
+    "rdkafka/curl",           # 链系统 libcurl（librdkafka 2.12 的 OAUTHBEARER OIDC 强制依赖 curl.h；ABI 稳）
+]
+
+[dependencies]
+hi-kafka-proto.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4.5", features = ["derive", "env"] }
+async-trait = "0.1"
+once_cell = "1.21"
+# 给 #9 panic guard 用的 `FutureExt::catch_unwind`；std 只有 sync 版的 catch_unwind
+futures = { version = "0.3", default-features = false, features = ["std"] }
+rdkafka = { version = "0.38", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+dashmap = { version = "6.1", optional = true }
