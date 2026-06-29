@@ -1,10 +1,12 @@
 use anyhow::Context;
 use clap::Parser;
-use hi_kafka_worker::{Metrics, cluster::ClusterRegistry, metrics, server, shutdown::ShutdownState};
+use hi_kafka_worker::{
+    cluster::ClusterRegistry, metrics, server, shutdown::ShutdownState, Metrics,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -38,7 +40,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_new(&cli.log_level).unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_new(&cli.log_level).unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(true)
         .init();
 
@@ -55,9 +59,9 @@ async fn main() -> anyhow::Result<()> {
         info!(%brokers, "preregistered 'default' cluster from --brokers");
     }
     let producer = build_producer(registry.clone());
-    let consumer = build_consumer(registry.clone());
     let shutdown = ShutdownState::new();
     let m = Metrics::new();
+    let consumer = build_consumer(registry.clone(), m.clone());
 
     if !cli.metrics_addr.is_empty() {
         match cli.metrics_addr.parse::<SocketAddr>() {
@@ -129,26 +133,36 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "kafka")]
-fn build_producer(registry: hi_kafka_worker::ClusterRegistryHandle) -> hi_kafka_worker::ProducerHandle {
+fn build_producer(
+    registry: hi_kafka_worker::ClusterRegistryHandle,
+) -> hi_kafka_worker::ProducerHandle {
     use hi_kafka_worker::producer::KafkaProducer;
     use std::sync::Arc;
     Arc::new(KafkaProducer::new(registry))
 }
 
 #[cfg(not(feature = "kafka"))]
-fn build_producer(_registry: hi_kafka_worker::ClusterRegistryHandle) -> hi_kafka_worker::ProducerHandle {
+fn build_producer(
+    _registry: hi_kafka_worker::ClusterRegistryHandle,
+) -> hi_kafka_worker::ProducerHandle {
     tracing::warn!("kafka feature disabled; using LoggingProducer");
     hi_kafka_worker::producer::logging()
 }
 
 #[cfg(feature = "kafka")]
-fn build_consumer(registry: hi_kafka_worker::ClusterRegistryHandle) -> hi_kafka_worker::ConsumerHandle {
+fn build_consumer(
+    registry: hi_kafka_worker::ClusterRegistryHandle,
+    metrics: std::sync::Arc<hi_kafka_worker::Metrics>,
+) -> hi_kafka_worker::ConsumerHandle {
     use hi_kafka_worker::consumer::{KafkaConsumer, KafkaConsumerConfig};
     use std::sync::Arc;
-    Arc::new(KafkaConsumer::new(registry, KafkaConsumerConfig::default()))
+    Arc::new(KafkaConsumer::new(registry, KafkaConsumerConfig::default()).with_metrics(metrics))
 }
 
 #[cfg(not(feature = "kafka"))]
-fn build_consumer(_registry: hi_kafka_worker::ClusterRegistryHandle) -> hi_kafka_worker::ConsumerHandle {
+fn build_consumer(
+    _registry: hi_kafka_worker::ClusterRegistryHandle,
+    _metrics: std::sync::Arc<hi_kafka_worker::Metrics>,
+) -> hi_kafka_worker::ConsumerHandle {
     hi_kafka_worker::consumer::logging()
 }

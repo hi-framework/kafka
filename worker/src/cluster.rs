@@ -97,7 +97,11 @@ impl ClusterRegistry {
     }
 
     pub async fn get(&self, name: &str) -> Option<ClusterConfig> {
-        self.clusters.read().await.get(name).map(|e| e.config.clone())
+        self.clusters
+            .read()
+            .await
+            .get(name)
+            .map(|e| e.config.clone())
     }
 
     /// P1 #7：同时取回当前 config 和 version。Producer/Consumer 用 version
@@ -121,16 +125,16 @@ impl ClusterRegistry {
     /// 拿到集群的 OAuth token slot 句柄（Arc clone）。
     /// 供 Producer / Consumer 在创建 librdkafka 客户端时把句柄塞进 ClientContext。
     pub async fn token_slot_for(&self, name: &str) -> Option<OAuthTokenSlot> {
-        self.clusters.read().await.get(name).map(|e| e.token.clone())
+        self.clusters
+            .read()
+            .await
+            .get(name)
+            .map(|e| e.token.clone())
     }
 
     /// 写入或覆盖某 cluster 的 OAuth token。返回该 slot 的 Arc 句柄
     /// 供调用方记录到日志或后续比对。集群未注册时返回 `Err`。
-    pub async fn set_oauth_token(
-        &self,
-        name: &str,
-        token: StoredOAuthToken,
-    ) -> Result<(), String> {
+    pub async fn set_oauth_token(&self, name: &str, token: StoredOAuthToken) -> Result<(), String> {
         let map = self.clusters.read().await;
         let entry = map
             .get(name)
@@ -144,6 +148,11 @@ impl ClusterRegistry {
     #[allow(dead_code)]
     pub async fn len(&self) -> usize {
         self.clusters.read().await.len()
+    }
+
+    #[allow(dead_code)]
+    pub async fn is_empty(&self) -> bool {
+        self.clusters.read().await.is_empty()
     }
 }
 
@@ -194,8 +203,10 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_clusters_isolated() {
         let r = ClusterRegistry::new();
-        r.register("main".into(), [("k".into(), "v1".into())].into()).await;
-        r.register("audit".into(), [("k".into(), "v2".into())].into()).await;
+        r.register("main".into(), [("k".into(), "v1".into())].into())
+            .await;
+        r.register("audit".into(), [("k".into(), "v2".into())].into())
+            .await;
         assert_eq!(r.len().await, 2);
         assert_eq!(r.get("main").await.unwrap().get("k").unwrap(), "v1");
         assert_eq!(r.get("audit").await.unwrap().get("k").unwrap(), "v2");
@@ -244,13 +255,13 @@ mod tests {
         r.register("c".into(), cfg("b:9092")).await;
         let slot2 = r.token_slot_for("c").await.unwrap();
 
-        assert!(Arc::ptr_eq(&slot1, &slot2), "token slot 应在 config 覆盖后保留");
+        assert!(
+            Arc::ptr_eq(&slot1, &slot2),
+            "token slot 应在 config 覆盖后保留"
+        );
 
         // 通过任一句柄写入，另一句柄都能看到
         r.set_oauth_token("c", token("jwt-x")).await.unwrap();
-        assert_eq!(
-            slot1.lock().unwrap().as_ref().unwrap().token_value,
-            "jwt-x"
-        );
+        assert_eq!(slot1.lock().unwrap().as_ref().unwrap().token_value, "jwt-x");
     }
 }

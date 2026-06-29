@@ -5,8 +5,8 @@
 //!
 //! 用 [`Notify`] 唤醒在 `accept` 上等的 server 主循环。
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::Notify;
 
 #[derive(Debug, Default)]

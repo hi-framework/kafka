@@ -2,12 +2,31 @@
 //! 验证 server 能正确解码并 dispatch。
 
 use bytes::BytesMut;
-use hi_kafka_proto::{FrameType, ProduceFnf, encode_frame};
+use hi_kafka_proto::{encode_frame, FrameType, HelloReq, ProduceFnf, HEADER_LEN, PROTOCOL_MAJOR};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+/// 发 HELLO 并读 HELLO RESP，校验 server major。
+async fn handshake(client: &mut UnixStream) {
+    let mut payload = BytesMut::new();
+    HelloReq {
+        major: PROTOCOL_MAJOR,
+    }
+    .encode(&mut payload)
+    .unwrap();
+    let mut frame = BytesMut::new();
+    encode_frame(FrameType::Hello, 0, &payload, &mut frame).unwrap();
+    client.write_all(&frame).await.unwrap();
+    client.flush().await.unwrap();
+    // RESP 固定 HEADER_LEN + 1B major
+    let mut resp = vec![0u8; HEADER_LEN + 1];
+    client.read_exact(&mut resp).await.unwrap();
+    assert_eq!(resp[4], FrameType::Hello as u8);
+    assert_eq!(resp[HEADER_LEN], PROTOCOL_MAJOR);
+}
 
 static SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -38,8 +57,9 @@ async fn test_produce_fnf_end_to_end() {
     }
     assert!(socket.exists(), "socket not ready");
 
-    // 客户端连
+    // 客户端连 + 握手
     let mut client = UnixStream::connect(&socket).await.unwrap();
+    handshake(&mut client).await;
 
     // 编一帧 PRODUCE_FNF
     let msg = ProduceFnf {
@@ -81,6 +101,7 @@ async fn test_multiple_frames_on_same_connection() {
     }
 
     let mut client = UnixStream::connect(&socket).await.unwrap();
+    handshake(&mut client).await;
 
     for i in 0..10 {
         let msg = ProduceFnf {

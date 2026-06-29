@@ -1,19 +1,20 @@
 use crate::cluster::{ClusterRegistryHandle, StoredOAuthToken};
-use futures::FutureExt;
-use std::panic::AssertUnwindSafe;
 use crate::consumer::{ConsumerHandle, SubscriptionId};
 use crate::metrics::Metrics;
 use crate::producer::ProducerHandle;
 use crate::shutdown::ShutdownHandle;
 use anyhow::Context;
 use bytes::BytesMut;
+use futures::FutureExt;
 use hi_kafka_proto::{
-    CommitReq, CommitResp, DeliveryErr, FrameType, HEADER_LEN, PauseResumeOp, PauseResumeReq,
-    PauseResumeResp, PollRebalanceReq, PollRebalanceResp, PollReq, PollResp, ProduceFnf,
-    ProduceReq, ProduceResp, RegisterClusterReq, RegisterClusterResp, SeekReq, SeekResp,
-    SendOffsetsReq, SendOffsetsResp, SetOAuthBearerTokenReq, SetOAuthBearerTokenResp, SubscribeReq,
-    SubscribeResp, TxnOp, TxnReq, TxnResp, UnsubscribeReq, codec, encode_frame,
+    codec, encode_frame, CommitReq, CommitResp, DeliveryErr, FrameType, HelloReq, HelloResp,
+    PauseResumeOp, PauseResumeReq, PauseResumeResp, PollRebalanceReq, PollRebalanceResp, PollReq,
+    PollResp, ProduceFnf, ProduceReq, ProduceResp, RegisterClusterReq, RegisterClusterResp,
+    SeekReq, SeekResp, SendOffsetsReq, SendOffsetsResp, SetOAuthBearerTokenReq,
+    SetOAuthBearerTokenResp, SubscribeReq, SubscribeResp, TxnOp, TxnReq, TxnResp, UnsubscribeReq,
+    HEADER_LEN, PROTOCOL_MAJOR,
 };
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,6 +198,9 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     let mut header_buf = [0u8; HEADER_LEN];
     let mut payload_buf = BytesMut::new();
+    // F: 第一帧必须是 HELLO 且 PROTOCOL_MAJOR 与 worker 自身一致；
+    // 否则关连接（让客户端 read 端 EOF → pool 视为 connect 失败，重试）
+    let mut handshaked = false;
 
     loop {
         if let Err(e) = stream.read_exact(&mut header_buf).await {
@@ -224,7 +228,44 @@ async fn handle_connection(
         }
         payload_buf.clear();
         payload_buf.resize(header.payload_len as usize, 0);
-        stream.read_exact(&mut payload_buf).await.context("read payload")?;
+        stream
+            .read_exact(&mut payload_buf)
+            .await
+            .context("read payload")?;
+
+        // F: 握手——在 dispatch 业务帧前先完成
+        if !handshaked {
+            if header.kind != FrameType::Hello {
+                warn!(
+                    cid = header.cid,
+                    kind = ?header.kind,
+                    "first frame is not HELLO; closing connection"
+                );
+                anyhow::bail!("handshake required, got {:?}", header.kind);
+            }
+            let hello = HelloReq::decode(&payload_buf).context("decode HELLO payload")?;
+            if hello.major != PROTOCOL_MAJOR {
+                warn!(
+                    client_major = hello.major,
+                    server_major = PROTOCOL_MAJOR,
+                    "HELLO major mismatch; closing connection"
+                );
+                anyhow::bail!(
+                    "PROTOCOL_MAJOR mismatch: client {} vs server {}",
+                    hello.major,
+                    PROTOCOL_MAJOR
+                );
+            }
+            let resp = HelloResp {
+                major: PROTOCOL_MAJOR,
+            };
+            let mut resp_buf = BytesMut::new();
+            resp.encode(&mut resp_buf).context("encode HELLO resp")?;
+            write_frame(&mut stream, FrameType::Hello, header.cid, &resp_buf).await?;
+            handshaked = true;
+            debug!(cid = header.cid, "HELLO handshake ok");
+            continue;
+        }
 
         dispatch(
             &mut stream,
@@ -241,7 +282,40 @@ async fn handle_connection(
     }
 }
 
+/// I: 外层 panic 兜底。每帧 dispatch 整体 catch_unwind，panic 时返回 Err
+/// 让 `handle_connection` 关连接（客户端见 EOF → with_retry 触发自愈）。
+///
+/// `handle_produce_req` 内部已有更精细的 catch_unwind + fallback ProduceResp::Err
+/// （retryable=true 配合 idempotence 安全去重），那层会先 catch，外层只对其它
+/// 10 个 handler 的 panic 生效——这些路径上 panic 多发生在协议解码或 worker
+/// 内部数据结构上，broker 状态不变；at-least-once 语义下客户端重试是安全的。
 async fn dispatch(
+    stream: &mut UnixStream,
+    kind: FrameType,
+    cid: u64,
+    payload: &[u8],
+    producer: &ProducerHandle,
+    consumer: &ConsumerHandle,
+    registry: &ClusterRegistryHandle,
+    shutdown: &ShutdownHandle,
+    metrics: &Arc<Metrics>,
+) -> anyhow::Result<()> {
+    let result = AssertUnwindSafe(dispatch_inner(
+        stream, kind, cid, payload, producer, consumer, registry, shutdown, metrics,
+    ))
+    .catch_unwind()
+    .await;
+    match result {
+        Ok(r) => r,
+        Err(panic) => {
+            let msg = describe_panic(&panic);
+            error!(cid, ?kind, panic = %msg, "dispatch panicked, closing connection");
+            Err(anyhow::anyhow!("dispatch panic [{kind:?}]: {msg}"))
+        }
+    }
+}
+
+async fn dispatch_inner(
     stream: &mut UnixStream,
     kind: FrameType,
     cid: u64,
@@ -254,7 +328,9 @@ async fn dispatch(
 ) -> anyhow::Result<()> {
     match kind {
         FrameType::Hello => {
-            info!(cid, payload_len = payload.len(), "HELLO received");
+            // 握手已经在 handle_connection 第一帧时处理完。如果握手后又收到
+            // HELLO，说明客户端实现有 bug——记 warn 但不强行关连接（兼容容错）。
+            warn!(cid, "spurious HELLO after handshake; ignoring");
         }
         FrameType::Ping => {
             debug!(cid, "PING received");
@@ -471,7 +547,8 @@ async fn handle_poll_rebalance(
         },
     };
     let mut buf = BytesMut::new();
-    resp.encode(&mut buf).context("encode poll_rebalance_resp")?;
+    resp.encode(&mut buf)
+        .context("encode poll_rebalance_resp")?;
     write_frame(stream, FrameType::PollRebalanceResp, cid, &buf).await
 }
 
@@ -657,7 +734,9 @@ async fn handle_register_cluster(
             let config: std::collections::HashMap<_, _> = req.config.into_iter().collect();
             if !config.contains_key("bootstrap.servers") {
                 RegisterClusterResp::Err {
-                    message: format!("cluster '{cluster}': missing required key 'bootstrap.servers'"),
+                    message: format!(
+                        "cluster '{cluster}': missing required key 'bootstrap.servers'"
+                    ),
                 }
             } else {
                 let added = registry.register(cluster.clone(), config).await;
@@ -670,7 +749,8 @@ async fn handle_register_cluster(
         },
     };
     let mut buf = BytesMut::new();
-    resp.encode(&mut buf).context("encode register_cluster_resp")?;
+    resp.encode(&mut buf)
+        .context("encode register_cluster_resp")?;
     write_frame(stream, FrameType::RegisterClusterResp, cid, &buf).await
 }
 

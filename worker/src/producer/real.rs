@@ -5,14 +5,14 @@ use crate::consumer::GroupMetadataHandle;
 use crate::producer::Producer;
 use anyhow::Context;
 use hi_kafka_proto::{DeliveryAck, DeliveryErr, OffsetCommit, ProduceFnf, ProduceResp};
-use rdkafka::ClientConfig;
-use rdkafka::Offset;
 use rdkafka::client::{ClientContext, OAuthToken};
 use rdkafka::consumer::ConsumerGroupMetadata;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header as RdHeader, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer as _};
 use rdkafka::topic_partition_list::TopicPartitionList;
+use rdkafka::ClientConfig;
+use rdkafka::Offset;
 
 /// Producer 端的自定义 ClientContext，只为提供 OAuth token 回调。
 /// 不持有任何 producer 相关状态——FutureProducer 自己包装我们这个 ctx
@@ -152,7 +152,9 @@ impl KafkaProducer {
             .registry
             .get_with_version(cluster)
             .await
-            .with_context(|| format!("cluster '{cluster}' not registered (call registerCluster first)"))?;
+            .with_context(|| {
+                format!("cluster '{cluster}' not registered (call registerCluster first)")
+            })?;
 
         let transactional = cluster_cfg.contains_key("transactional.id");
 
@@ -268,9 +270,7 @@ impl Producer for KafkaProducer {
     async fn begin_transaction(&self, cluster: &str) -> anyhow::Result<()> {
         let entry = self.entry_for(cluster).await?;
         if !entry.transactional {
-            anyhow::bail!(
-                "cluster '{cluster}' has no transactional.id; cannot begin transaction"
-            );
+            anyhow::bail!("cluster '{cluster}' has no transactional.id; cannot begin transaction");
         }
         let _guard = entry.txn_lock.lock().await;
         let p = entry.producer.clone();
@@ -421,9 +421,7 @@ impl Producer for KafkaProducer {
 
 fn kafka_error_to_resp(err: &KafkaError) -> DeliveryErr {
     let (code, retryable) = match err {
-        KafkaError::MessageProduction(rd_err) => {
-            (rd_err_code_to_u16(rd_err), is_retryable(rd_err))
-        }
+        KafkaError::MessageProduction(rd_err) => (rd_err_code_to_u16(rd_err), is_retryable(rd_err)),
         _ => (u16::MAX, false),
     };
     DeliveryErr {
@@ -477,6 +475,6 @@ fn is_retryable(code: &RDKafkaErrorCode) -> bool {
             // 临时不可用类（NetworkException 已覆盖大部分）的补充：
             | RebalanceInProgress         // 群组正在 rebalance，稍后再来
             | UnknownTopicOrPartition     // 可能是 metadata 还没刷新到所有分区
-            | ConcurrentTransactions      // 事务客户端互相阻塞，重试可以放行
+            | ConcurrentTransactions // 事务客户端互相阻塞，重试可以放行
     )
 }

@@ -10,12 +10,11 @@
 
 use crate::cluster::{ClusterRegistryHandle, OAuthTokenSlot};
 use crate::consumer::{Consumer, ConsumerError, GroupMetadataHandle, SubscriptionId};
+use crate::metrics::Metrics;
 use anyhow::Context;
 use bytes::Bytes;
 use dashmap::DashMap;
-use hi_kafka_proto::{
-    ConsumerMessage, OffsetSpec, PartitionSpec, RebalanceEvent, SubscribeReq,
-};
+use hi_kafka_proto::{ConsumerMessage, OffsetSpec, PartitionSpec, RebalanceEvent, SubscribeReq};
 use rdkafka::client::{ClientContext, OAuthToken};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{
@@ -26,9 +25,9 @@ use rdkafka::topic_partition_list::TopicPartitionList;
 use rdkafka::Offset;
 use rdkafka::{ClientConfig, Message};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
@@ -168,10 +167,8 @@ impl Default for KafkaConsumerConfig {
             (buffer_capacity * 2 / 10).max(1),
         );
         // 字节限默认 64 MiB / sub，pause=80%，resume=20%
-        let buffer_bytes_capacity = read_env_usize(
-            "HI_KAFKA_CONSUMER_BUFFER_BYTES",
-            64 * 1024 * 1024,
-        );
+        let buffer_bytes_capacity =
+            read_env_usize("HI_KAFKA_CONSUMER_BUFFER_BYTES", 64 * 1024 * 1024);
         let pause_at_bytes = read_env_usize(
             "HI_KAFKA_CONSUMER_PAUSE_AT_BYTES",
             (buffer_bytes_capacity * 8 / 10).max(1),
@@ -225,6 +222,10 @@ struct SubscriptionState {
     pause_total: AtomicU64,
     /// 自动 resume 累计触发次数
     resume_total: AtomicU64,
+    /// J: Prometheus 指标聚合句柄。SubscriptionState 持 Option 是为了让 LoggingConsumer
+    /// 这类轻量后端无需注入也能跑；KafkaConsumer 通过 `with_metrics()` 注入后，
+    /// 自动 pause / resume / buffer overflow drop / stream error 都会更新对应 counter。
+    metrics: Option<Arc<Metrics>>,
     /// P0 #3：stream 拉取循环已经退出（broker 协议错 / 端流关 / 永久 authn 失败）。
     /// 用 poll() 检查这个标志，立即给 PHP 端返回明确错误，业务层走 virtual_id
     /// 自愈重订阅，而不是无声 timeout。
@@ -249,6 +250,9 @@ pub struct KafkaConsumer {
     registry: ClusterRegistryHandle,
     config: KafkaConsumerConfig,
     subscriptions: DashMap<SubscriptionId, Arc<SubscriptionState>>,
+    /// J: 可选指标聚合句柄。`KafkaConsumer::new()` 不强制注入，方便测试；
+    /// 生产期由 `worker_entry.rs` / `main.rs` 通过 `with_metrics()` 注入。
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl KafkaConsumer {
@@ -257,7 +261,14 @@ impl KafkaConsumer {
             registry,
             config,
             subscriptions: DashMap::new(),
+            metrics: None,
         }
+    }
+
+    /// 注入 Metrics 句柄，后续 subscribe 出来的 SubscriptionState 会从这里 clone。
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// 取某 subscription 的实时背压观测。供 Prometheus / 测试断言用。
@@ -343,6 +354,7 @@ impl Consumer for KafkaConsumer {
         let buffer_bytes_capacity = self.config.buffer_bytes_capacity;
         let pause_at_bytes = self.config.pause_at_bytes;
 
+        let metrics_clone = self.metrics.clone();
         let state = Arc::new_cyclic(|weak| {
             let weak = weak.clone();
             let consumer_for_task = consumer.clone();
@@ -371,6 +383,7 @@ impl Consumer for KafkaConsumer {
                 buffer_bytes: AtomicUsize::new(0),
                 messages_dropped_total: AtomicU64::new(0),
                 task,
+                metrics: metrics_clone,
             }
         });
 
@@ -470,14 +483,12 @@ impl Consumer for KafkaConsumer {
             .clone();
         let consumer = state.consumer.clone();
         // rdkafka commit 是同步阻塞调用，放 spawn_blocking
-        tokio::task::spawn_blocking(move || {
-            consumer.commit_consumer_state(CommitMode::Sync)
-        })
-        .await
-        .context("spawn_blocking commit")
-        .map_err(ConsumerError::Backend)?
-        .context("commit")
-        .map_err(ConsumerError::Backend)?;
+        tokio::task::spawn_blocking(move || consumer.commit_consumer_state(CommitMode::Sync))
+            .await
+            .context("spawn_blocking commit")
+            .map_err(ConsumerError::Backend)?
+            .context("commit")
+            .map_err(ConsumerError::Backend)?;
         debug!(?sub, "committed");
         Ok(())
     }
@@ -532,7 +543,12 @@ impl Consumer for KafkaConsumer {
         tokio::task::spawn_blocking(move || {
             for (topic, partition, offset) in targets {
                 consumer
-                    .seek(&topic, partition, Offset::Offset(offset), Duration::from_secs(5))
+                    .seek(
+                        &topic,
+                        partition,
+                        Offset::Offset(offset),
+                        Duration::from_secs(5),
+                    )
                     .with_context(|| format!("seek {topic}:{partition} → {offset}"))?;
             }
             Ok::<_, anyhow::Error>(())
@@ -598,11 +614,10 @@ impl Consumer for KafkaConsumer {
         let consumer = state.consumer.clone();
         tokio::task::spawn_blocking(move || {
             // 1. 构造 TPL：空 partitions → 取当前 assignment
+            let used_assignment = partitions.is_empty();
             let mut tpl = TopicPartitionList::new();
-            if partitions.is_empty() {
-                let assignment = consumer
-                    .assignment()
-                    .context("get current assignment")?;
+            if used_assignment {
+                let assignment = consumer.assignment().context("get current assignment")?;
                 for el in assignment.elements() {
                     tpl.add_partition_offset(
                         el.topic(),
@@ -613,12 +628,20 @@ impl Consumer for KafkaConsumer {
                 }
             } else {
                 for (topic, partition) in partitions {
-                    tpl.add_partition_offset(
-                        &topic,
-                        partition,
-                        Offset::Offset(timestamp_ms),
-                    )
-                    .context("add to tpl")?;
+                    tpl.add_partition_offset(&topic, partition, Offset::Offset(timestamp_ms))
+                        .context("add to tpl")?;
+                }
+            }
+            // E: 没目标分区就显式报错——业务方往往在 ASSIGN 还没回来时
+            // 就喊"seek 我当前所有分区"，原实现 silent Ok 让 bug 沉默。
+            if tpl.count() == 0 {
+                if used_assignment {
+                    anyhow::bail!(
+                        "seek_by_timestamp: 当前 subscription 还没拿到任何 partition assignment；\
+                         请等至少一次 ASSIGN rebalance 事件再调，或显式传 partitions"
+                    );
+                } else {
+                    anyhow::bail!("seek_by_timestamp: 传入的 partitions 列表为空");
                 }
             }
             // 2. 用 offsets_for_times 解析每分区在该 timestamp 的实际 offset
@@ -628,7 +651,7 @@ impl Consumer for KafkaConsumer {
             // 3. seek 到解析出来的 offset
             for el in resolved.elements() {
                 let offset = match el.offset() {
-                    Offset::Invalid => continue,        // 没找到对应时间戳的消息
+                    Offset::Invalid => continue, // 没找到对应时间戳的消息
                     Offset::Offset(o) => Offset::Offset(o),
                     other => other,
                 };
@@ -675,9 +698,7 @@ async fn flow_control(
         // 1. 构造 TPL：空 partitions → 取当前 assignment
         let mut tpl = TopicPartitionList::new();
         if partitions.is_empty() {
-            let assignment = consumer
-                .assignment()
-                .context("get current assignment")?;
+            let assignment = consumer.assignment().context("get current assignment")?;
             for el in assignment.elements() {
                 tpl.add_partition(el.topic(), el.partition());
             }
@@ -748,8 +769,7 @@ fn try_transition_to_resumed(
 fn message_bytes(m: &ConsumerMessage) -> usize {
     m.key.len()
         + m.value.len()
-        + m
-            .headers
+        + m.headers
             .iter()
             .map(|(n, v)| n.len() + v.len())
             .sum::<usize>()
@@ -773,6 +793,9 @@ fn maybe_pause(
         return; // 已 paused
     }
     state.pause_total.fetch_add(1, Ordering::Relaxed);
+    if let Some(m) = state.metrics.as_ref() {
+        Metrics::inc(&m.consumer_pause_total);
+    }
     let consumer = state.consumer.clone();
     tokio::task::spawn_blocking(move || {
         let assignment = match consumer.assignment() {
@@ -785,8 +808,10 @@ fn maybe_pause(
         if let Err(e) = consumer.pause(&assignment) {
             warn!(?sub, error = ?e, "auto-pause: consumer.pause failed");
         } else {
-            info!(?sub, buf_len, buf_bytes, count_trip, bytes_trip,
-                  "auto-pause: 自动暂停 fetcher");
+            info!(
+                ?sub,
+                buf_len, buf_bytes, count_trip, bytes_trip, "auto-pause: 自动暂停 fetcher"
+            );
         }
     });
 }
@@ -807,6 +832,9 @@ fn maybe_resume(
         return; // 本就没 paused
     }
     state.resume_total.fetch_add(1, Ordering::Relaxed);
+    if let Some(m) = state.metrics.as_ref() {
+        Metrics::inc(&m.consumer_resume_total);
+    }
     let consumer = state.consumer.clone();
     tokio::task::spawn_blocking(move || {
         let assignment = match consumer.assignment() {
@@ -826,12 +854,51 @@ fn maybe_resume(
 
 /// 标记 subscription 已终结，唤醒等待中的 poll。
 fn mark_terminated(state: &Arc<SubscriptionState>, reason: String) {
-    *state
-        .last_error
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(reason);
+    *state.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
     state.terminated.store(true, Ordering::Release);
     state.notify.notify_waiters();
+}
+
+/// 判定 rdkafka stream 错误是否「立刻终止订阅」级别。
+///
+/// 触发条件：客户端配错 / 被 kicked 的鉴权 / 授权问题，重试不会成功，留着
+/// 只会无限 backoff 浪费资源且让 PHP 端 long-poll 一直拿不到「subscription
+/// 已死」信号。
+fn is_fatal_stream_error(e: &rdkafka::error::KafkaError) -> bool {
+    use rdkafka::error::{KafkaError as Err, RDKafkaErrorCode as Code};
+    // 客户端构造 / 配置类——重试无意义
+    if matches!(
+        e,
+        Err::AdminOpCreation(_) | Err::ClientCreation(_) | Err::ClientConfig(..)
+    ) {
+        return true;
+    }
+    // `MessageConsumptionFatal` 顾名思义是 librdkafka 标记的不可恢复消费错误
+    if matches!(e, Err::MessageConsumptionFatal(_)) {
+        return true;
+    }
+    // 提取携带 RDKafkaErrorCode 的变体里的实际 code
+    let code = match e {
+        Err::MessageConsumption(c)
+        | Err::Global(c)
+        | Err::Rebalance(c)
+        | Err::SetPartitionOffset(c)
+        | Err::StoreOffset(c)
+        | Err::MetadataFetch(c)
+        | Err::OffsetFetch(c)
+        | Err::ConsumerCommit(c) => *c,
+        _ => return false,
+    };
+    // 鉴权 / 授权类——broker 拒绝且 librdkafka 不会自动恢复
+    matches!(
+        code,
+        Code::SaslAuthenticationFailed
+            | Code::GroupAuthorizationFailed
+            | Code::TopicAuthorizationFailed
+            | Code::ClusterAuthorizationFailed
+            | Code::DelegationTokenAuthDisabled
+            | Code::DelegationTokenAuthorizationFailed
+    )
 }
 
 /// 后台 stream 拉取循环。
@@ -840,8 +907,8 @@ fn mark_terminated(state: &Arc<SubscriptionState>, reason: String) {
 /// 这里 upgrade 失败、自动退出。
 ///
 /// P0 #3 修：
-/// - Err 路径加指数退避，避免致命错（authn / 协议不兼容）形成 hot loop；
-/// - None / 不可恢复错路径设 `terminated=true`，让 poll 立刻给 PHP 回错。
+/// - Err 路径加指数退避，避免致命错（authn / 协议不兼容）形成 hot loop
+/// - None / 不可恢复错路径设 `terminated=true`，让 poll 立刻给 PHP 回错
 async fn stream_loop(
     consumer: Arc<StreamConsumer<RebalanceCtx>>,
     state: std::sync::Weak<SubscriptionState>,
@@ -855,24 +922,43 @@ async fn stream_loop(
     // 指数退避：50ms → 100 → 200 → ... → 5s 封顶；成功一次重置
     let mut backoff_ms: u64 = 50;
     const BACKOFF_MAX_MS: u64 = 5_000;
+    // 连续失败兜底：60 次不能成功就 terminated。配合 5s backoff 上限，
+    // 约 ≥5 分钟无任何成功 → 让 PHP 走 virtual_id 自愈重订阅，不再死磕。
+    let mut consecutive_errors: u32 = 0;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 60;
     loop {
         let msg = match stream.next().await {
             Some(Ok(m)) => {
                 backoff_ms = 50; // 成功一次复位
+                consecutive_errors = 0;
                 m
             }
             Some(Err(e)) => {
                 let kind = format!("{e}");
-                let is_fatal = matches!(
-                    e,
-                    rdkafka::error::KafkaError::AdminOpCreation(_)
-                        | rdkafka::error::KafkaError::ClientCreation(_)
-                        | rdkafka::error::KafkaError::ClientConfig(_, _, _, _)
+                let is_fatal = is_fatal_stream_error(&e);
+                consecutive_errors += 1;
+                let exhausted = consecutive_errors >= MAX_CONSECUTIVE_ERRORS;
+                warn!(
+                    ?sub_id,
+                    error = %kind,
+                    is_fatal,
+                    consecutive_errors,
+                    "kafka stream error"
                 );
-                warn!(?sub_id, error = %kind, is_fatal, "kafka stream error");
-                if is_fatal {
+                // J: 每条 stream error 都计数（fatal + non-fatal），让 ops 观察错误率
+                if let Some(s) = state.upgrade() {
+                    if let Some(m) = s.metrics.as_ref() {
+                        Metrics::inc(&m.consumer_stream_errors_total);
+                    }
+                }
+                if is_fatal || exhausted {
                     if let Some(s) = state.upgrade() {
-                        mark_terminated(&s, format!("fatal: {kind}"));
+                        let reason = if is_fatal {
+                            format!("fatal: {kind}")
+                        } else {
+                            format!("too many consecutive errors ({consecutive_errors}): {kind}")
+                        };
+                        mark_terminated(&s, reason);
                     }
                     return;
                 }
@@ -882,7 +968,10 @@ async fn stream_loop(
                 continue;
             }
             None => {
-                info!(?sub_id, "kafka stream ended, marking subscription terminated");
+                info!(
+                    ?sub_id,
+                    "kafka stream ended, marking subscription terminated"
+                );
                 if let Some(s) = state.upgrade() {
                     mark_terminated(&s, "stream ended".into());
                 }
@@ -903,9 +992,7 @@ async fn stream_loop(
                     let h = hdrs.get(i);
                     out.push((
                         h.key.to_string(),
-                        h.value
-                            .map(|v| Bytes::copy_from_slice(v))
-                            .unwrap_or_default(),
+                        h.value.map(Bytes::copy_from_slice).unwrap_or_default(),
                     ));
                 }
                 out
@@ -923,13 +1010,10 @@ async fn stream_loop(
             partition: msg.partition(),
             offset: msg.offset(),
             timestamp_ms: msg.timestamp().to_millis().unwrap_or(0),
-            key: msg
-                .key()
-                .map(|k| Bytes::copy_from_slice(k))
-                .unwrap_or_default(),
+            key: msg.key().map(Bytes::copy_from_slice).unwrap_or_default(),
             value: msg
                 .payload()
-                .map(|v| Bytes::copy_from_slice(v))
+                .map(Bytes::copy_from_slice)
                 .unwrap_or_default(),
             headers,
         };
@@ -951,9 +1035,10 @@ async fn stream_loop(
                 state
                     .buffer_bytes
                     .fetch_sub(dropped_bytes, Ordering::Relaxed);
-                state
-                    .messages_dropped_total
-                    .fetch_add(1, Ordering::Relaxed);
+                state.messages_dropped_total.fetch_add(1, Ordering::Relaxed);
+                if let Some(m) = state.metrics.as_ref() {
+                    Metrics::inc(&m.consumer_messages_dropped_total);
+                }
             }
             error!(
                 buffer_capacity,

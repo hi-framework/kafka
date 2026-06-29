@@ -5,8 +5,8 @@
 
 use hi_kafka_proto::{ConsumerMessage, OffsetSpec, PartitionSpec, RebalanceEvent, SubscribeReq};
 use std::any::Any;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
@@ -232,17 +232,15 @@ mod tests {
     #[tokio::test]
     async fn test_poll_returns_injected_messages() {
         let c = LoggingConsumer::new();
-        c.inject(vec![
-            ConsumerMessage {
-                topic: "t".into(),
-                partition: 0,
-                offset: 0,
-                timestamp_ms: 1,
-                key: Bytes::from_static(b"k"),
-                value: Bytes::from_static(b"v"),
-                headers: vec![],
-            },
-        ])
+        c.inject(vec![ConsumerMessage {
+            topic: "t".into(),
+            partition: 0,
+            offset: 0,
+            timestamp_ms: 1,
+            key: Bytes::from_static(b"k"),
+            value: Bytes::from_static(b"v"),
+            headers: vec![],
+        }])
         .await;
         let sub = c.subscribe(fake_req()).await.unwrap();
         let r = c.poll(sub, 10, 0).await.unwrap();
@@ -254,8 +252,12 @@ mod tests {
         let c = LoggingConsumer::new();
         c.inject(vec![
             ConsumerMessage {
-                topic: "t".into(), partition: 0, offset: 0, timestamp_ms: 1,
-                key: Bytes::new(), value: Bytes::new(),
+                topic: "t".into(),
+                partition: 0,
+                offset: 0,
+                timestamp_ms: 1,
+                key: Bytes::new(),
+                value: Bytes::new(),
                 headers: vec![],
             };
             5

@@ -7,8 +7,8 @@
 //! 不解析 header，只读到第一个 `\r\n` 就响应。
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,6 +27,14 @@ pub struct Metrics {
     pub produce_resp_err_total: AtomicU64,
 
     pub frames_dropped_draining_total: AtomicU64,
+
+    // J: Consumer 背压指标——跨 subscription 求和（不带 label）。
+    // per-subscription 粒度仍可通过 `KafkaConsumer::backpressure_stats()` API 在
+    // 业务侧排障使用；这些 counter 是给 Prometheus 长期趋势监控的。
+    pub consumer_pause_total: AtomicU64,
+    pub consumer_resume_total: AtomicU64,
+    pub consumer_messages_dropped_total: AtomicU64,
+    pub consumer_stream_errors_total: AtomicU64,
 
     started_at: once_cell::sync::OnceCell<Instant>,
 }
@@ -119,6 +127,27 @@ impl Metrics {
             frames_dropped_draining_total
         );
 
+        emit_counter!(
+            "hi_kafka_consumer_pause_total",
+            "Total auto-pause transitions triggered by backpressure (sum across subscriptions)",
+            consumer_pause_total
+        );
+        emit_counter!(
+            "hi_kafka_consumer_resume_total",
+            "Total auto-resume transitions after backpressure relief (sum across subscriptions)",
+            consumer_resume_total
+        );
+        emit_counter!(
+            "hi_kafka_consumer_messages_dropped_total",
+            "Total consumer messages dropped due to hard buffer overflow (sum across subscriptions)",
+            consumer_messages_dropped_total
+        );
+        emit_counter!(
+            "hi_kafka_consumer_stream_errors_total",
+            "Total rdkafka stream errors fatal+non-fatal (sum across subscriptions)",
+            consumer_stream_errors_total
+        );
+
         s
     }
 }
@@ -154,11 +183,7 @@ async fn handle_request(mut stream: TcpStream, metrics: Arc<Metrics>) -> anyhow:
 
     let (status, body, content_type) = if first_line.starts_with("GET /metrics") {
         let body = metrics.to_prometheus_text();
-        (
-            "200 OK",
-            body,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )
+        ("200 OK", body, "text/plain; version=0.0.4; charset=utf-8")
     } else if first_line.starts_with("GET /healthz") {
         ("200 OK", "ok\n".to_string(), "text/plain")
     } else {
@@ -188,6 +213,35 @@ mod tests {
         assert!(text.contains("hi_kafka_worker_uptime_seconds"));
         assert!(text.contains("hi_kafka_worker_info{version="));
         assert!(text.contains("# TYPE hi_kafka_produce_resp_ok_total counter"));
+    }
+
+    #[test]
+    fn test_consumer_backpressure_counters_in_prometheus() {
+        let m = Metrics::new();
+        Metrics::inc(&m.consumer_pause_total);
+        Metrics::inc(&m.consumer_pause_total);
+        Metrics::inc(&m.consumer_resume_total);
+        Metrics::inc(&m.consumer_messages_dropped_total);
+        Metrics::inc(&m.consumer_stream_errors_total);
+        Metrics::inc(&m.consumer_stream_errors_total);
+        Metrics::inc(&m.consumer_stream_errors_total);
+        let text = m.to_prometheus_text();
+        assert!(text.contains("hi_kafka_consumer_pause_total 2"));
+        assert!(text.contains("hi_kafka_consumer_resume_total 1"));
+        assert!(text.contains("hi_kafka_consumer_messages_dropped_total 1"));
+        assert!(text.contains("hi_kafka_consumer_stream_errors_total 3"));
+        // 4 个 counter 都应有 # TYPE 元行
+        for c in [
+            "hi_kafka_consumer_pause_total",
+            "hi_kafka_consumer_resume_total",
+            "hi_kafka_consumer_messages_dropped_total",
+            "hi_kafka_consumer_stream_errors_total",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {c} counter")),
+                "missing TYPE for {c}"
+            );
+        }
     }
 
     #[test]
