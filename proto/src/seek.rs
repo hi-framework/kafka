@@ -59,8 +59,12 @@ pub enum SeekReq {
 impl SeekReq {
     pub fn subscription_id(&self) -> u64 {
         match self {
-            Self::ByOffset { subscription_id, .. } => *subscription_id,
-            Self::ByTimestamp { subscription_id, .. } => *subscription_id,
+            Self::ByOffset {
+                subscription_id, ..
+            } => *subscription_id,
+            Self::ByTimestamp {
+                subscription_id, ..
+            } => *subscription_id,
         }
     }
 
@@ -223,10 +227,7 @@ mod tests {
     fn test_seek_by_offset_roundtrip() {
         let r = SeekReq::ByOffset {
             subscription_id: 7,
-            targets: vec![
-                ("orders".into(), 0, 100),
-                ("orders".into(), 1, 200),
-            ],
+            targets: vec![("orders".into(), 0, 100), ("orders".into(), 1, 200)],
         };
         let mut buf = BytesMut::new();
         r.encode(&mut buf).unwrap();

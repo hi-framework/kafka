@@ -87,9 +87,8 @@ impl SetOAuthBearerTokenReq {
             return Err(PayloadError::Truncated);
         }
         let ext_count = buf.get_u32() as usize;
-        // cap 预分配，防恶意 n=u32::MAX 把 with_capacity 撑爆；
-        // 真实 SASL extension 几个键足够，1024 是数量级上限。
-        let mut extensions = Vec::with_capacity(ext_count.min(1024));
+        // P3: SASL extension 实际只用零星几个 kv，64 足够覆盖任何 mechanism。
+        let mut extensions = Vec::with_capacity(ext_count.min(64));
         for _ in 0..ext_count {
             let k = read_str_u16(&mut buf, "ext_key")?;
             let v = read_str_u16(&mut buf, "ext_val")?;

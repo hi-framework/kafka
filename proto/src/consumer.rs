@@ -68,7 +68,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::payload::{MessageHeader, PayloadError, read_headers, write_headers};
+use crate::payload::{read_headers, write_headers, MessageHeader, PayloadError};
 
 const STATUS_OK: u8 = 0x00;
 const STATUS_ERR: u8 = 0x01;
@@ -114,7 +114,8 @@ impl SubscribeReq {
             return Err(PayloadError::Truncated);
         }
         let n = buf.get_u16() as usize;
-        // n 上界 u16::MAX=65535，topic 实际订阅几十个封顶，1024 留余量。
+        // P3: 解码侧 alloc 上限。即便上层有 MAX_PAYLOAD_LEN 总闸，预 alloc 大 Vec 仍能
+        // 让短瞬内存激增。topics 实际几百够用；config 走 librdkafka 200+ 键的上限。
         let mut topics = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
             topics.push(read_str_u16(&mut buf, "topic")?);
@@ -123,7 +124,6 @@ impl SubscribeReq {
             return Err(PayloadError::Truncated);
         }
         let m = buf.get_u16() as usize;
-        // librdkafka consumer 配置项不超百，256 留余量。
         let mut config = Vec::with_capacity(m.min(256));
         for _ in 0..m {
             let k = read_str_u16(&mut buf, "cfg_key")?;
@@ -310,9 +310,9 @@ impl PollResp {
                     return Err(PayloadError::Truncated);
                 }
                 let n = buf.get_u32() as usize;
-                // 单次 poll 返回的消息数；PHP 端 max_messages 入参一般几百到一千，
-                // 8192 已极宽。配合 codec MAX_PAYLOAD_LEN=16MiB 双重防护。
-                let mut messages = Vec::with_capacity(n.min(8192));
+                // P3: 防御解码侧 alloc DoS。单次 poll 批 64K 条已经足够任何业务。
+                // 真要 64K+，分多次 poll 即可。
+                let mut messages = Vec::with_capacity(n.min(65_536));
                 for _ in 0..n {
                     messages.push(ConsumerMessage::decode(&mut buf)?);
                 }
@@ -450,7 +450,7 @@ impl RegisterClusterReq {
             return Err(PayloadError::Truncated);
         }
         let n = buf.get_u16() as usize;
-        // RegisterClusterReq 的 librdkafka 配置项，256 足够。
+        // P3: 与 SubscribeReq::decode 一致——librdkafka 200+ 键封顶。
         let mut config = Vec::with_capacity(n.min(256));
         for _ in 0..n {
             let k = read_str_u16(&mut buf, "cfg_key")?;
@@ -560,7 +560,9 @@ mod tests {
 
     #[test]
     fn test_subscribe_resp_ok() {
-        let orig = SubscribeResp::Ok { subscription_id: 42 };
+        let orig = SubscribeResp::Ok {
+            subscription_id: 42,
+        };
         let mut buf = BytesMut::new();
         orig.encode(&mut buf).unwrap();
         assert_eq!(SubscribeResp::decode(&buf).unwrap(), orig);
@@ -607,9 +609,7 @@ mod tests {
                     timestamp_ms: 1_700_000_000_000,
                     key: Bytes::from_static(b"k1"),
                     value: Bytes::from_static(b"v1"),
-                    headers: vec![
-                        ("traceparent".into(), Bytes::from_static(b"00-aaaa-bbbb-01")),
-                    ],
+                    headers: vec![("traceparent".into(), Bytes::from_static(b"00-aaaa-bbbb-01"))],
                 },
                 ConsumerMessage {
                     topic: "orders".into(),
@@ -629,7 +629,9 @@ mod tests {
 
     #[test]
     fn test_commit_req_resp() {
-        let req = CommitReq { subscription_id: 99 };
+        let req = CommitReq {
+            subscription_id: 99,
+        };
         let mut buf = BytesMut::new();
         req.encode(&mut buf).unwrap();
         assert_eq!(CommitReq::decode(&buf).unwrap(), req);
@@ -660,7 +662,10 @@ mod tests {
         let orig = RegisterClusterReq {
             cluster: "orders".into(),
             config: vec![
-                ("bootstrap.servers".into(), "kafka-1:9092,kafka-2:9092".into()),
+                (
+                    "bootstrap.servers".into(),
+                    "kafka-1:9092,kafka-2:9092".into(),
+                ),
                 ("compression.type".into(), "lz4".into()),
                 ("sasl.mechanism".into(), "PLAIN".into()),
             ],
@@ -674,7 +679,10 @@ mod tests {
     fn test_register_cluster_resp_ok_err() {
         let mut buf = BytesMut::new();
         RegisterClusterResp::Ok.encode(&mut buf).unwrap();
-        assert_eq!(RegisterClusterResp::decode(&buf).unwrap(), RegisterClusterResp::Ok);
+        assert_eq!(
+            RegisterClusterResp::decode(&buf).unwrap(),
+            RegisterClusterResp::Ok
+        );
 
         let err = RegisterClusterResp::Err {
             message: "missing bootstrap.servers".into(),

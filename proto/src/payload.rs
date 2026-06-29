@@ -52,6 +52,55 @@ pub type MessageHeader = (String, Bytes);
 pub const AUTO_PARTITION: i32 = -1;
 pub const AUTO_TIMESTAMP: i64 = -1;
 
+/// HELLO 帧 payload：仅 `[u8 major]`。
+///
+/// 协议握手语义：扩展端每条新建 UDS 连接的第一帧必须是 HELLO，并带上扩展
+/// 自身编译的 `PROTOCOL_MAJOR`。worker 收到后校验 major 与自身一致，一致
+/// 时回一个 HELLO 帧（payload 为 worker 的 server major），不一致直接关
+/// 连接，扩展侧 read 端 EOF → 视为 connect 失败（pool 重试）。
+///
+/// 把握手挪到协议层显式实现而不是依赖默认行为，是为了：
+/// - 升级 PROTOCOL_MAJOR 时双端不匹配能即时拒绝，不会出现「字段错位静默
+///   解码出垃圾值」这种灾难
+/// - worker 重启换不同 build / 不同 commit 时给客户端一次明确感知
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelloReq {
+    pub major: u8,
+}
+
+impl HelloReq {
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), PayloadError> {
+        buf.put_u8(self.major);
+        Ok(())
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, PayloadError> {
+        if buf.is_empty() {
+            return Err(PayloadError::Truncated);
+        }
+        Ok(Self { major: buf[0] })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelloResp {
+    pub major: u8,
+}
+
+impl HelloResp {
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), PayloadError> {
+        buf.put_u8(self.major);
+        Ok(())
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, PayloadError> {
+        if buf.is_empty() {
+            return Err(PayloadError::Truncated);
+        }
+        Ok(Self { major: buf[0] })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProduceFnf {
     pub cluster: String,
@@ -114,7 +163,10 @@ impl ProduceFnf {
     }
 }
 
-pub(crate) fn write_headers(headers: &[MessageHeader], buf: &mut BytesMut) -> Result<(), PayloadError> {
+pub(crate) fn write_headers(
+    headers: &[MessageHeader],
+    buf: &mut BytesMut,
+) -> Result<(), PayloadError> {
     if headers.len() > u32::MAX as usize {
         return Err(PayloadError::FieldTooLarge(headers.len()));
     }
@@ -314,10 +366,7 @@ mod tests {
                     Bytes::from_static(b"00-1234567890abcdef-fedcba0987654321-01"),
                 ),
                 ("source".into(), Bytes::from_static(b"web")),
-                (
-                    "x-binary".into(),
-                    Bytes::from_static(&[0x00, 0xff, 0x42]),
-                ),
+                ("x-binary".into(), Bytes::from_static(&[0x00, 0xff, 0x42])),
             ],
             ..Default::default()
         };

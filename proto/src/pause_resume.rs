@@ -90,9 +90,9 @@ impl PauseResumeReq {
             return Err(PayloadError::Truncated);
         }
         let count = buf.get_u32() as usize;
-        // cap 预分配，u32::MAX 的恶意 count 会撑爆 with_capacity；
-        // 单 subscription 分区数实际几千封顶，8192 留余量。
-        let mut partitions = Vec::with_capacity(count.min(8192));
+        // P3: 单 subscription 最多管几千分区已是极限（Kafka 推荐单 broker
+        // ≤4K，整集群 ~20K）。8K 上限抵御解码侧 alloc DoS 同时不限正常用法。
+        let mut partitions = Vec::with_capacity(count.min(8_192));
         for _ in 0..count {
             let topic = read_str_u16(&mut buf, "topic")?;
             if buf.remaining() < 4 {

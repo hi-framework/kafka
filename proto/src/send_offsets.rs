@@ -73,8 +73,8 @@ impl SendOffsetsReq {
             return Err(PayloadError::Truncated);
         }
         let count = buf.get_u32() as usize;
-        // cap 预分配；同 pause_resume 的分区上限语义。
-        let mut offsets = Vec::with_capacity(count.min(8192));
+        // P3: 与 pause_resume 同源——每分区一个 offset，8K 上限抵御解码侧 alloc DoS。
+        let mut offsets = Vec::with_capacity(count.min(8_192));
         for _ in 0..count {
             let topic = read_str_u16(&mut buf, "topic")?;
             if buf.remaining() < 12 {
