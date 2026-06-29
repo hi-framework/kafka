@@ -5,9 +5,12 @@
 
 use bytes::BytesMut;
 use hi_kafka_proto::{
-    CommitReq, CommitResp, ConsumerMessage, FrameType, HEADER_LEN, PayloadError, PollReq, PollResp,
-    ProduceFnf, ProduceResp, RegisterClusterReq, RegisterClusterResp, SubscribeReq, SubscribeResp,
-    UnsubscribeReq, codec, encode_frame,
+    codec, encode_frame, CommitReq, CommitResp, ConsumerMessage, FrameType, HelloReq, HelloResp,
+    OffsetCommit, OffsetSpec, PartitionSpec, PauseResumeOp, PauseResumeReq, PauseResumeResp,
+    PayloadError, PollRebalanceReq, PollRebalanceResp, PollReq, PollResp, ProduceFnf, ProduceResp,
+    RebalanceEvent, RegisterClusterReq, RegisterClusterResp, SeekReq, SeekResp, SendOffsetsReq,
+    SendOffsetsResp, SetOAuthBearerTokenReq, SetOAuthBearerTokenResp, SubscribeReq, SubscribeResp,
+    TxnOp, TxnReq, TxnResp, UnsubscribeReq, HEADER_LEN, PROTOCOL_MAJOR,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,6 +22,54 @@ pub fn next_cid() -> u64 {
 
 pub fn header_len() -> usize {
     HEADER_LEN
+}
+
+// === HELLO 握手 =============================================================
+
+/// 编一帧 HELLO 请求（payload = `[u8 PROTOCOL_MAJOR]`，cid=0）。
+/// 任意新建 UDS 连接的第一帧必须是它。
+pub fn build_hello_frame() -> anyhow::Result<Vec<u8>> {
+    let mut payload = BytesMut::new();
+    HelloReq {
+        major: PROTOCOL_MAJOR,
+    }
+    .encode(&mut payload)
+    .map_err(|e| anyhow::anyhow!("encode HELLO payload: {e}"))?;
+    let mut frame = BytesMut::new();
+    encode_frame(FrameType::Hello, 0, &payload, &mut frame)
+        .map_err(|e| anyhow::anyhow!("encode HELLO frame: {e}"))?;
+    Ok(frame.to_vec())
+}
+
+/// 解析 HELLO RESP 完整帧（13B header + 1B payload），校验 server major。
+/// 不匹配的版本返回 Err。
+pub fn parse_hello_resp(bytes: &[u8]) -> anyhow::Result<()> {
+    if bytes.len() < HEADER_LEN {
+        anyhow::bail!("HELLO RESP too short: {} < {}", bytes.len(), HEADER_LEN);
+    }
+    let header = codec::decode_header(&bytes[..HEADER_LEN])
+        .map_err(|e| anyhow::anyhow!("decode HELLO RESP header: {e}"))?;
+    if header.kind != FrameType::Hello {
+        anyhow::bail!(
+            "expected HELLO RESP, got {:?} (cid={})",
+            header.kind,
+            header.cid
+        );
+    }
+    let need = HEADER_LEN + header.payload_len as usize;
+    if bytes.len() < need {
+        anyhow::bail!("HELLO RESP payload truncated: {} < {}", bytes.len(), need);
+    }
+    let resp = HelloResp::decode(&bytes[HEADER_LEN..need])
+        .map_err(|e| anyhow::anyhow!("decode HELLO RESP: {e}"))?;
+    if resp.major != PROTOCOL_MAJOR {
+        anyhow::bail!(
+            "PROTOCOL_MAJOR mismatch: client {} vs server {}",
+            PROTOCOL_MAJOR,
+            resp.major
+        );
+    }
+    Ok(())
 }
 
 pub fn build_fnf_frame(
@@ -83,8 +134,8 @@ pub fn parse_resp_frame(bytes: &[u8]) -> anyhow::Result<ParsedFrame> {
     let payload = &bytes[HEADER_LEN..need];
     match header.kind {
         FrameType::ProduceResp => {
-            let resp = ProduceResp::decode(payload)
-                .map_err(|e| anyhow::anyhow!("decode resp: {e}"))?;
+            let resp =
+                ProduceResp::decode(payload).map_err(|e| anyhow::anyhow!("decode resp: {e}"))?;
             Ok(ParsedFrame::Resp {
                 cid: header.cid,
                 resp,
@@ -228,16 +279,194 @@ pub fn build_register_cluster_frame(
     Ok((cid, frame.to_vec()))
 }
 
+// === Phase 3.x REQ encoders（给 Swoole/Swow driver 用） =====================
+
+/// 编一帧 PAUSE_RESUME_REQ。`op` 为 0 (Pause) 或 1 (Resume)。
+/// `partitions` 空数组 = 应用到当前 assignment 全部分区。
+pub fn build_pause_resume_frame(
+    subscription_id: u64,
+    op: PauseResumeOp,
+    partitions: Vec<(String, i32)>,
+) -> anyhow::Result<(u64, Vec<u8>)> {
+    let req = PauseResumeReq {
+        subscription_id,
+        op,
+        partitions,
+    };
+    encode_req(FrameType::PauseResumeReq, |b| req.encode(b))
+}
+
+/// 编一帧 SEEK_REQ（按 offset 模式）。
+pub fn build_seek_by_offset_frame(
+    subscription_id: u64,
+    targets: Vec<OffsetSpec>,
+) -> anyhow::Result<(u64, Vec<u8>)> {
+    let req = SeekReq::ByOffset {
+        subscription_id,
+        targets,
+    };
+    encode_req(FrameType::SeekReq, |b| req.encode(b))
+}
+
+/// 编一帧 SEEK_REQ（按 timestamp 模式）。`partitions` 空 = 当前 assignment 全部。
+pub fn build_seek_by_timestamp_frame(
+    subscription_id: u64,
+    timestamp_ms: i64,
+    partitions: Vec<PartitionSpec>,
+) -> anyhow::Result<(u64, Vec<u8>)> {
+    let req = SeekReq::ByTimestamp {
+        subscription_id,
+        timestamp_ms,
+        partitions,
+    };
+    encode_req(FrameType::SeekReq, |b| req.encode(b))
+}
+
+/// 编一帧 TXN_REQ。`op` 为 0 (Begin) / 1 (Commit) / 2 (Abort)。
+pub fn build_txn_frame(cluster: &str, op: TxnOp) -> anyhow::Result<(u64, Vec<u8>)> {
+    let req = TxnReq {
+        cluster: cluster.to_string(),
+        op,
+    };
+    encode_req(FrameType::TxnReq, |b| req.encode(b))
+}
+
+/// 编一帧 SEND_OFFSETS_REQ（EOS stream 用，必须在 BEGIN/COMMIT 之间调）。
+pub fn build_send_offsets_frame(
+    producer_cluster: &str,
+    subscription_id: u64,
+    group_id: &str,
+    offsets: Vec<OffsetCommit>,
+) -> anyhow::Result<(u64, Vec<u8>)> {
+    let req = SendOffsetsReq {
+        producer_cluster: producer_cluster.to_string(),
+        subscription_id,
+        group_id: group_id.to_string(),
+        offsets,
+    };
+    encode_req(FrameType::SendOffsetsReq, |b| req.encode(b))
+}
+
+/// 编一帧 SET_OAUTH_BEARER_TOKEN_REQ。
+pub fn build_set_oauth_token_frame(
+    cluster: &str,
+    token_value: &str,
+    lifetime_ms: i64,
+    principal_name: &str,
+    extensions: Vec<(String, String)>,
+) -> anyhow::Result<(u64, Vec<u8>)> {
+    let req = SetOAuthBearerTokenReq {
+        cluster: cluster.to_string(),
+        token_value: token_value.to_string(),
+        lifetime_ms,
+        principal_name: principal_name.to_string(),
+        extensions,
+    };
+    encode_req(FrameType::SetOAuthBearerTokenReq, |b| req.encode(b))
+}
+
+/// 编一帧 POLL_REBALANCE_REQ。
+pub fn build_poll_rebalance_frame(
+    subscription_id: u64,
+    max_events: u32,
+) -> anyhow::Result<(u64, Vec<u8>)> {
+    let req = PollRebalanceReq {
+        subscription_id,
+        max_events,
+    };
+    encode_req(FrameType::PollRebalanceReq, |b| req.encode(b))
+}
+
+/// 共用编帧 helper——分配 cid + payload encode + frame encode。
+fn encode_req<F>(kind: FrameType, encode_payload: F) -> anyhow::Result<(u64, Vec<u8>)>
+where
+    F: FnOnce(&mut BytesMut) -> Result<(), PayloadError>,
+{
+    let mut payload = BytesMut::new();
+    encode_payload(&mut payload).map_err(|e| anyhow::anyhow!("encode payload {kind:?}: {e}"))?;
+    let cid = next_cid();
+    let mut frame = BytesMut::new();
+    encode_frame(kind, cid, &payload, &mut frame)
+        .map_err(|e| anyhow::anyhow!("encode frame {kind:?}: {e}"))?;
+    Ok((cid, frame.to_vec()))
+}
+
 #[derive(Debug)]
 pub enum ConsumerResp {
-    SubscribeOk { cid: u64, subscription_id: u64 },
-    SubscribeErr { cid: u64, message: String },
-    PollOk { cid: u64, messages: Vec<ConsumerMessage> },
-    PollErr { cid: u64, message: String },
-    CommitOk { cid: u64 },
-    CommitErr { cid: u64, message: String },
-    RegisterClusterOk { cid: u64 },
-    RegisterClusterErr { cid: u64, message: String },
+    SubscribeOk {
+        cid: u64,
+        subscription_id: u64,
+    },
+    SubscribeErr {
+        cid: u64,
+        message: String,
+    },
+    PollOk {
+        cid: u64,
+        messages: Vec<ConsumerMessage>,
+    },
+    PollErr {
+        cid: u64,
+        message: String,
+    },
+    CommitOk {
+        cid: u64,
+    },
+    CommitErr {
+        cid: u64,
+        message: String,
+    },
+    RegisterClusterOk {
+        cid: u64,
+    },
+    RegisterClusterErr {
+        cid: u64,
+        message: String,
+    },
+    // Phase 3.x RESP
+    PauseResumeOk {
+        cid: u64,
+    },
+    PauseResumeErr {
+        cid: u64,
+        message: String,
+    },
+    SeekOk {
+        cid: u64,
+    },
+    SeekErr {
+        cid: u64,
+        message: String,
+    },
+    TxnOk {
+        cid: u64,
+    },
+    TxnErr {
+        cid: u64,
+        message: String,
+    },
+    SendOffsetsOk {
+        cid: u64,
+    },
+    SendOffsetsErr {
+        cid: u64,
+        message: String,
+    },
+    SetOAuthTokenOk {
+        cid: u64,
+    },
+    SetOAuthTokenErr {
+        cid: u64,
+        message: String,
+    },
+    PollRebalanceOk {
+        cid: u64,
+        events: Vec<RebalanceEvent>,
+    },
+    PollRebalanceErr {
+        cid: u64,
+        message: String,
+    },
 }
 
 pub fn parse_consumer_resp_frame(bytes: &[u8]) -> anyhow::Result<ConsumerResp> {
@@ -265,18 +494,18 @@ pub fn parse_consumer_resp_frame(bytes: &[u8]) -> anyhow::Result<ConsumerResp> {
                 message,
             },
         },
-        FrameType::PollResp => match PollResp::decode(payload)
-            .map_err(|e| anyhow::anyhow!("decode PollResp: {e}"))?
-        {
-            PollResp::Ok { messages } => ConsumerResp::PollOk {
-                cid: header.cid,
-                messages,
-            },
-            PollResp::Err { message } => ConsumerResp::PollErr {
-                cid: header.cid,
-                message,
-            },
-        },
+        FrameType::PollResp => {
+            match PollResp::decode(payload).map_err(|e| anyhow::anyhow!("decode PollResp: {e}"))? {
+                PollResp::Ok { messages } => ConsumerResp::PollOk {
+                    cid: header.cid,
+                    messages,
+                },
+                PollResp::Err { message } => ConsumerResp::PollErr {
+                    cid: header.cid,
+                    message,
+                },
+            }
+        }
         FrameType::CommitResp => match CommitResp::decode(payload)
             .map_err(|e| anyhow::anyhow!("decode CommitResp: {e}"))?
         {
@@ -291,6 +520,63 @@ pub fn parse_consumer_resp_frame(bytes: &[u8]) -> anyhow::Result<ConsumerResp> {
         {
             RegisterClusterResp::Ok => ConsumerResp::RegisterClusterOk { cid: header.cid },
             RegisterClusterResp::Err { message } => ConsumerResp::RegisterClusterErr {
+                cid: header.cid,
+                message,
+            },
+        },
+        FrameType::PauseResumeResp => match PauseResumeResp::decode(payload)
+            .map_err(|e| anyhow::anyhow!("decode PauseResumeResp: {e}"))?
+        {
+            PauseResumeResp::Ok => ConsumerResp::PauseResumeOk { cid: header.cid },
+            PauseResumeResp::Err { message } => ConsumerResp::PauseResumeErr {
+                cid: header.cid,
+                message,
+            },
+        },
+        FrameType::SeekResp => {
+            match SeekResp::decode(payload).map_err(|e| anyhow::anyhow!("decode SeekResp: {e}"))? {
+                SeekResp::Ok => ConsumerResp::SeekOk { cid: header.cid },
+                SeekResp::Err { message } => ConsumerResp::SeekErr {
+                    cid: header.cid,
+                    message,
+                },
+            }
+        }
+        FrameType::TxnResp => {
+            match TxnResp::decode(payload).map_err(|e| anyhow::anyhow!("decode TxnResp: {e}"))? {
+                TxnResp::Ok => ConsumerResp::TxnOk { cid: header.cid },
+                TxnResp::Err { message } => ConsumerResp::TxnErr {
+                    cid: header.cid,
+                    message,
+                },
+            }
+        }
+        FrameType::SendOffsetsResp => match SendOffsetsResp::decode(payload)
+            .map_err(|e| anyhow::anyhow!("decode SendOffsetsResp: {e}"))?
+        {
+            SendOffsetsResp::Ok => ConsumerResp::SendOffsetsOk { cid: header.cid },
+            SendOffsetsResp::Err { message } => ConsumerResp::SendOffsetsErr {
+                cid: header.cid,
+                message,
+            },
+        },
+        FrameType::SetOAuthBearerTokenResp => match SetOAuthBearerTokenResp::decode(payload)
+            .map_err(|e| anyhow::anyhow!("decode SetOAuthBearerTokenResp: {e}"))?
+        {
+            SetOAuthBearerTokenResp::Ok => ConsumerResp::SetOAuthTokenOk { cid: header.cid },
+            SetOAuthBearerTokenResp::Err { message } => ConsumerResp::SetOAuthTokenErr {
+                cid: header.cid,
+                message,
+            },
+        },
+        FrameType::PollRebalanceResp => match PollRebalanceResp::decode(payload)
+            .map_err(|e| anyhow::anyhow!("decode PollRebalanceResp: {e}"))?
+        {
+            PollRebalanceResp::Ok { events } => ConsumerResp::PollRebalanceOk {
+                cid: header.cid,
+                events,
+            },
+            PollRebalanceResp::Err { message } => ConsumerResp::PollRebalanceErr {
                 cid: header.cid,
                 message,
             },

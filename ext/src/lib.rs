@@ -1,4 +1,21 @@
+// 业务 API（produce/subscribe + 完整 options）天然多参数；保留可读签名
+// 而不是塞一个 Options struct 让 PHP 调用方更难用。
+#![allow(clippy::too_many_arguments)]
+// 数组组合 helpers 用 `.iter()/.into_iter()/.zip()/.collect()` 链式可读性比
+// "fold + 显式 IntoIterator" 强，且 PHP 调用层的代码生成器倾向 explicit。
+#![allow(clippy::useless_conversion)]
+// ext-php-rs 的 ZendHashTable::insert 在错误时只能透传错误链，map_err 到
+// PhpException 是标准用法——切到 inspect_err 反而丢类型。
+#![allow(
+    clippy::manual_map,
+    clippy::manual_ok_err,
+    clippy::manual_inspect,
+    clippy::manual_flatten,
+    clippy::redundant_pattern_matching
+)]
+
 mod client;
+mod cluster_replay;
 mod ini_config;
 mod ipc;
 mod pool;
@@ -8,6 +25,7 @@ mod subscription;
 mod worker_entry;
 mod worker_health;
 
+use ext_php_rs::binary::Binary;
 use ext_php_rs::binary_slice::BinarySlice;
 use ext_php_rs::convert::IntoZval;
 use ext_php_rs::prelude::*;
@@ -32,12 +50,17 @@ pub fn hi_kafka_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// 显式启动 worker（如果还没在跑）。命中缓存时零开销直接返回。
+/// 显式启动 worker（如果还没在跑）。
+/// L: 业务显式调用时**强制 fresh probe**——invalidate 内部缓存后 ensure 会调
+/// spawn::ensure_worker（内部 worker_alive 是 ~50μs UDS probe），死了就重新 spawn
+/// + 重放 cluster；活着就直接通过。这保证"业务调完 ensureWorker 后下一行 produce
+/// 一定不会再触发 worker 自愈 retry"语义成立。频繁 produce 的 hot path 仍走
+/// `ipc::ensure` 自己的 cache 快路径，不受影响。
 #[php_function]
 pub fn hi_kafka_ensure_worker(socket: Option<String>) -> PhpResult<()> {
     let socket = resolve_socket(socket.as_deref());
-    worker_health::ensure(&socket)
-        .map_err(|e| PhpException::default(format!("ensure_worker: {e}")))?;
+    worker_health::invalidate(&socket);
+    ipc::ensure(&socket).map_err(|e| PhpException::default(format!("ensure_worker: {e}")))?;
     Ok(())
 }
 
@@ -156,11 +179,7 @@ pub fn hi_kafka_subscribe(
 
 /// 拉一批消息。命中底层 subscription not found 时透明重订阅 + 重试。
 #[php_function]
-pub fn hi_kafka_poll(
-    subscription_id: i64,
-    max_messages: i64,
-    timeout_ms: i64,
-) -> PhpResult<Zval> {
+pub fn hi_kafka_poll(subscription_id: i64, max_messages: i64, timeout_ms: i64) -> PhpResult<Zval> {
     let messages = subscription::poll(
         subscription_id as u64,
         max_messages.max(1) as u32,
@@ -341,21 +360,20 @@ pub(crate) fn messages_to_zval(messages: Vec<hi_kafka_proto::ConsumerMessage>) -
         inner
             .insert("timestamp_ms", m.timestamp_ms)
             .map_err(|e| PhpException::default(format!("timestamp_ms: {e}")))?;
-        let key_str = bytes_to_php_string(&m.key);
+        // M: binary-safe——Binary<u8> 直接走 zend string_init，全程 byte array，
+        // 不经 Rust `String` 的 UTF-8 不变式（之前 from_utf8_unchecked 是 UB）。
         inner
-            .insert("key", key_str.as_str())
+            .insert("key", Binary::<u8>::from(m.key.to_vec()))
             .map_err(|e| PhpException::default(format!("key: {e}")))?;
-        let val_str = bytes_to_php_string(&m.value);
         inner
-            .insert("value", val_str.as_str())
+            .insert("value", Binary::<u8>::from(m.value.to_vec()))
             .map_err(|e| PhpException::default(format!("value: {e}")))?;
 
         // Headers 关联数组：name → binary value
         let mut headers_ht = ZendHashTable::new();
         for (name, value) in &m.headers {
-            let v_str = bytes_to_php_string(value);
             headers_ht
-                .insert(name.as_str(), v_str.as_str())
+                .insert(name.as_str(), Binary::<u8>::from(value.to_vec()))
                 .map_err(|e| PhpException::default(format!("header {name}: {e}")))?;
         }
         let headers_zval = headers_ht
@@ -503,7 +521,24 @@ pub fn hi_kafka_header_len() -> i64 {
     protocol::header_len() as i64
 }
 
-/// 编一帧 PRODUCE_FNF（fire-and-forget），返回完整帧字节串（PHP 字符串）。
+/// 编一帧 HELLO（协议握手）。返回完整 14B 帧字节（PHP binary string）。
+///
+/// PHP 协程 driver 在新建 UDS 连接后必须先发它再发业务帧；worker 会用
+/// HELLO RESP 回应，校验 `PROTOCOL_MAJOR` 是否一致。
+#[php_function]
+pub fn hi_kafka_encode_hello_frame() -> PhpResult<Binary<u8>> {
+    let bytes = protocol::build_hello_frame().map_err(|e| PhpException::default(e.to_string()))?;
+    Ok(Binary::from(bytes))
+}
+
+/// 校验 HELLO RESP 帧；版本不匹配 / 帧格式不对 → 抛错。
+#[php_function]
+pub fn hi_kafka_verify_hello_resp(bytes: BinarySlice<u8>) -> PhpResult<()> {
+    protocol::parse_hello_resp(&bytes).map_err(|e| PhpException::default(e.to_string()))?;
+    Ok(())
+}
+
+/// 编一帧 PRODUCE_FNF（fire-and-forget），返回完整帧字节串（PHP binary string）。
 #[php_function]
 pub fn hi_kafka_encode_fnf_frame(
     cluster: &str,
@@ -513,7 +548,7 @@ pub fn hi_kafka_encode_fnf_frame(
     headers: Option<std::collections::HashMap<String, String>>,
     partition: Option<i64>,
     timestamp_ms: Option<i64>,
-) -> PhpResult<String> {
+) -> PhpResult<Binary<u8>> {
     let opts = build_options(headers, partition, timestamp_ms);
     let bytes = protocol::build_fnf_frame(
         cluster,
@@ -525,7 +560,7 @@ pub fn hi_kafka_encode_fnf_frame(
         opts.timestamp_ms,
     )
     .map_err(|e| PhpException::default(e.to_string()))?;
-    Ok(bytes_to_php_string(&bytes))
+    Ok(Binary::from(bytes))
 }
 
 /// 编一帧 PRODUCE_REQ，返回 `['cid' => int, 'frame' => binary]`。
@@ -550,20 +585,14 @@ pub fn hi_kafka_encode_req_frame(
         opts.timestamp_ms,
     )
     .map_err(|e| PhpException::default(e.to_string()))?;
-    let mut ht = ZendHashTable::new();
-    ht.insert("cid", cid as i64)
-        .map_err(|e| PhpException::default(format!("cid: {e}")))?;
-    ht.insert("frame", bytes_to_php_string(&bytes).as_str())
-        .map_err(|e| PhpException::default(format!("frame: {e}")))?;
-    ht.into_zval(false)
-        .map_err(|e| PhpException::default(format!("into_zval: {e}")))
+    cid_frame_zval(cid, bytes)
 }
 
 /// 仅解析 13B 帧头，返回 `['kind' => int, 'cid' => int, 'payload_len' => int]`。
 #[php_function]
 pub fn hi_kafka_parse_header(bytes: BinarySlice<u8>) -> PhpResult<Zval> {
-    let h = protocol::parse_header_only(&bytes)
-        .map_err(|e| PhpException::default(e.to_string()))?;
+    let h =
+        protocol::parse_header_only(&bytes).map_err(|e| PhpException::default(e.to_string()))?;
     let mut ht = ZendHashTable::new();
     ht.insert("kind", h.kind_byte as i64)
         .map_err(|e| PhpException::default(format!("kind: {e}")))?;
@@ -578,8 +607,8 @@ pub fn hi_kafka_parse_header(bytes: BinarySlice<u8>) -> PhpResult<Zval> {
 /// 解析完整 PRODUCE_RESP 帧（含 header + payload）。
 #[php_function]
 pub fn hi_kafka_decode_resp_frame(bytes: BinarySlice<u8>) -> PhpResult<Zval> {
-    let parsed = protocol::parse_resp_frame(&bytes)
-        .map_err(|e| PhpException::default(e.to_string()))?;
+    let parsed =
+        protocol::parse_resp_frame(&bytes).map_err(|e| PhpException::default(e.to_string()))?;
     let mut ht = ZendHashTable::new();
     match parsed {
         protocol::ParsedFrame::Resp { cid, resp } => {
@@ -616,11 +645,6 @@ pub fn hi_kafka_decode_resp_frame(bytes: BinarySlice<u8>) -> PhpResult<Zval> {
         .map_err(|e| PhpException::default(format!("into_zval: {e}")))
 }
 
-/// 字节流转 PHP 字符串。PHP 字符串本身二进制安全；Rust String 仅为内存表示。
-fn bytes_to_php_string(bytes: &[u8]) -> String {
-    unsafe { String::from_utf8_unchecked(bytes.to_vec()) }
-}
-
 // === Consumer 协议原语 =====================================================
 
 /// 编一帧 SUBSCRIBE_REQ。返回 `['cid' => int, 'frame' => binary]`。
@@ -632,10 +656,9 @@ pub fn hi_kafka_encode_subscribe_frame(
     config: Option<std::collections::HashMap<String, String>>,
 ) -> PhpResult<Zval> {
     let cfg_vec: Vec<(String, String)> = config.unwrap_or_default().into_iter().collect();
-    let (cid, bytes) =
-        protocol::build_subscribe_frame(cluster, group_id, topics, cfg_vec)
-            .map_err(|e| PhpException::default(e.to_string()))?;
-    cid_frame_zval(cid, &bytes)
+    let (cid, bytes) = protocol::build_subscribe_frame(cluster, group_id, topics, cfg_vec)
+        .map_err(|e| PhpException::default(e.to_string()))?;
+    cid_frame_zval(cid, bytes)
 }
 
 /// 编一帧 POLL_REQ。
@@ -651,7 +674,7 @@ pub fn hi_kafka_encode_poll_frame(
         timeout_ms.max(0) as u32,
     )
     .map_err(|e| PhpException::default(e.to_string()))?;
-    cid_frame_zval(cid, &bytes)
+    cid_frame_zval(cid, bytes)
 }
 
 /// 编一帧 COMMIT_REQ。
@@ -659,15 +682,15 @@ pub fn hi_kafka_encode_poll_frame(
 pub fn hi_kafka_encode_commit_frame(subscription_id: i64) -> PhpResult<Zval> {
     let (cid, bytes) = protocol::build_commit_frame(subscription_id as u64)
         .map_err(|e| PhpException::default(e.to_string()))?;
-    cid_frame_zval(cid, &bytes)
+    cid_frame_zval(cid, bytes)
 }
 
 /// 编一帧 UNSUBSCRIBE（无响应，cid=0）。
 #[php_function]
-pub fn hi_kafka_encode_unsubscribe_frame(subscription_id: i64) -> PhpResult<String> {
+pub fn hi_kafka_encode_unsubscribe_frame(subscription_id: i64) -> PhpResult<Binary<u8>> {
     let bytes = protocol::build_unsubscribe_frame(subscription_id as u64)
         .map_err(|e| PhpException::default(e.to_string()))?;
-    Ok(bytes_to_php_string(&bytes))
+    Ok(Binary::from(bytes))
 }
 
 /// 编一帧 REGISTER_CLUSTER_REQ。
@@ -679,7 +702,7 @@ pub fn hi_kafka_encode_register_cluster_frame(
     let cfg_vec: Vec<(String, String)> = config.into_iter().collect();
     let (cid, bytes) = protocol::build_register_cluster_frame(cluster, cfg_vec)
         .map_err(|e| PhpException::default(e.to_string()))?;
-    cid_frame_zval(cid, &bytes)
+    cid_frame_zval(cid, bytes)
 }
 
 /// 解析任意 consumer 响应帧（SUBSCRIBE_RESP / POLL_RESP / COMMIT_RESP），按 kind 分发。
@@ -749,16 +772,209 @@ pub fn hi_kafka_decode_consumer_resp(bytes: BinarySlice<u8>) -> PhpResult<Zval> 
             put(&mut ht, "ok", false)?;
             put(&mut ht, "message", message.as_str())?;
         }
+        // === Phase 3.x RESPs ===
+        protocol::ConsumerResp::PauseResumeOk { cid } => {
+            put(&mut ht, "kind", "pause_resume")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", true)?;
+        }
+        protocol::ConsumerResp::PauseResumeErr { cid, message } => {
+            put(&mut ht, "kind", "pause_resume")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", false)?;
+            put(&mut ht, "message", message.as_str())?;
+        }
+        protocol::ConsumerResp::SeekOk { cid } => {
+            put(&mut ht, "kind", "seek")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", true)?;
+        }
+        protocol::ConsumerResp::SeekErr { cid, message } => {
+            put(&mut ht, "kind", "seek")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", false)?;
+            put(&mut ht, "message", message.as_str())?;
+        }
+        protocol::ConsumerResp::TxnOk { cid } => {
+            put(&mut ht, "kind", "txn")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", true)?;
+        }
+        protocol::ConsumerResp::TxnErr { cid, message } => {
+            put(&mut ht, "kind", "txn")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", false)?;
+            put(&mut ht, "message", message.as_str())?;
+        }
+        protocol::ConsumerResp::SendOffsetsOk { cid } => {
+            put(&mut ht, "kind", "send_offsets")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", true)?;
+        }
+        protocol::ConsumerResp::SendOffsetsErr { cid, message } => {
+            put(&mut ht, "kind", "send_offsets")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", false)?;
+            put(&mut ht, "message", message.as_str())?;
+        }
+        protocol::ConsumerResp::SetOAuthTokenOk { cid } => {
+            put(&mut ht, "kind", "set_oauth_token")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", true)?;
+        }
+        protocol::ConsumerResp::SetOAuthTokenErr { cid, message } => {
+            put(&mut ht, "kind", "set_oauth_token")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", false)?;
+            put(&mut ht, "message", message.as_str())?;
+        }
+        protocol::ConsumerResp::PollRebalanceOk { cid, events } => {
+            put(&mut ht, "kind", "poll_rebalance")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", true)?;
+            let events_zval = rebalance_events_to_zval(events)?;
+            ht.insert("events", events_zval)
+                .map_err(|e| PhpException::default(format!("events: {e}")))?;
+        }
+        protocol::ConsumerResp::PollRebalanceErr { cid, message } => {
+            put(&mut ht, "kind", "poll_rebalance")?;
+            put(&mut ht, "cid", cid as i64)?;
+            put(&mut ht, "ok", false)?;
+            put(&mut ht, "message", message.as_str())?;
+        }
     }
     ht.into_zval(false)
         .map_err(|e| PhpException::default(format!("into_zval: {e}")))
 }
 
-fn cid_frame_zval(cid: u64, bytes: &[u8]) -> PhpResult<Zval> {
+// === Phase 3.x REQ encoders 暴露给 PHP（给 SwooleClient/SwowClient driver 用）===
+
+/// 编一帧 PAUSE_RESUME_REQ。`$op` 0=Pause / 1=Resume；`$topics` / `$partitions`
+/// 是平行数组（同长度），空 = 应用到当前 assignment 全部。
+#[php_function]
+pub fn hi_kafka_encode_pause_resume_frame(
+    subscription_id: i64,
+    op: i64,
+    topics: Vec<String>,
+    partitions: Vec<i64>,
+) -> PhpResult<Zval> {
+    let parts = build_partition_specs(topics, partitions).map_err(PhpException::default)?;
+    let op = match op {
+        0 => hi_kafka_proto::PauseResumeOp::Pause,
+        1 => hi_kafka_proto::PauseResumeOp::Resume,
+        n => {
+            return Err(PhpException::default(format!(
+                "invalid op {n} (0=Pause, 1=Resume)"
+            )))
+        }
+    };
+    let (cid, bytes) = protocol::build_pause_resume_frame(subscription_id as u64, op, parts)
+        .map_err(|e| PhpException::default(e.to_string()))?;
+    cid_frame_zval(cid, bytes)
+}
+
+/// 编一帧 SEEK_REQ（按 offset 模式）。三个平行数组同长度。
+#[php_function]
+pub fn hi_kafka_encode_seek_by_offset_frame(
+    subscription_id: i64,
+    topics: Vec<String>,
+    partitions: Vec<i64>,
+    offsets: Vec<i64>,
+) -> PhpResult<Zval> {
+    let targets =
+        build_offset_targets(topics, partitions, offsets).map_err(PhpException::default)?;
+    let (cid, bytes) = protocol::build_seek_by_offset_frame(subscription_id as u64, targets)
+        .map_err(|e| PhpException::default(e.to_string()))?;
+    cid_frame_zval(cid, bytes)
+}
+
+/// 编一帧 SEEK_REQ（按 timestamp 模式）。`$topics` / `$partitions` 同长度，
+/// 均空 = 应用到当前 assignment 全部分区。
+#[php_function]
+pub fn hi_kafka_encode_seek_by_timestamp_frame(
+    subscription_id: i64,
+    timestamp_ms: i64,
+    topics: Vec<String>,
+    partitions: Vec<i64>,
+) -> PhpResult<Zval> {
+    let parts = build_partition_specs(topics, partitions).map_err(PhpException::default)?;
+    let (cid, bytes) =
+        protocol::build_seek_by_timestamp_frame(subscription_id as u64, timestamp_ms, parts)
+            .map_err(|e| PhpException::default(e.to_string()))?;
+    cid_frame_zval(cid, bytes)
+}
+
+/// 编一帧 TXN_REQ。`$op` 0=Begin / 1=Commit / 2=Abort。
+#[php_function]
+pub fn hi_kafka_encode_txn_frame(cluster: &str, op: i64) -> PhpResult<Zval> {
+    let op = match op {
+        0 => hi_kafka_proto::TxnOp::Begin,
+        1 => hi_kafka_proto::TxnOp::Commit,
+        2 => hi_kafka_proto::TxnOp::Abort,
+        n => return Err(PhpException::default(format!("invalid op {n} (0/1/2)"))),
+    };
+    let (cid, bytes) =
+        protocol::build_txn_frame(cluster, op).map_err(|e| PhpException::default(e.to_string()))?;
+    cid_frame_zval(cid, bytes)
+}
+
+/// 编一帧 SEND_OFFSETS_REQ（EOS）。三个平行数组同长度。
+#[php_function]
+pub fn hi_kafka_encode_send_offsets_frame(
+    producer_cluster: &str,
+    subscription_id: i64,
+    group_id: &str,
+    topics: Vec<String>,
+    partitions: Vec<i64>,
+    offsets: Vec<i64>,
+) -> PhpResult<Zval> {
+    let offsets =
+        build_offset_targets(topics, partitions, offsets).map_err(PhpException::default)?;
+    let (cid, bytes) = protocol::build_send_offsets_frame(
+        producer_cluster,
+        subscription_id as u64,
+        group_id,
+        offsets,
+    )
+    .map_err(|e| PhpException::default(e.to_string()))?;
+    cid_frame_zval(cid, bytes)
+}
+
+/// 编一帧 SET_OAUTH_BEARER_TOKEN_REQ。
+#[php_function]
+pub fn hi_kafka_encode_set_oauth_token_frame(
+    cluster: &str,
+    token: &str,
+    lifetime_ms: i64,
+    principal_name: &str,
+    extensions: Option<std::collections::HashMap<String, String>>,
+) -> PhpResult<Zval> {
+    let ext_vec: Vec<(String, String)> = extensions.unwrap_or_default().into_iter().collect();
+    let (cid, bytes) =
+        protocol::build_set_oauth_token_frame(cluster, token, lifetime_ms, principal_name, ext_vec)
+            .map_err(|e| PhpException::default(e.to_string()))?;
+    cid_frame_zval(cid, bytes)
+}
+
+/// 编一帧 POLL_REBALANCE_REQ。
+#[php_function]
+pub fn hi_kafka_encode_poll_rebalance_frame(
+    subscription_id: i64,
+    max_events: i64,
+) -> PhpResult<Zval> {
+    let (cid, bytes) =
+        protocol::build_poll_rebalance_frame(subscription_id as u64, max_events.max(1) as u32)
+            .map_err(|e| PhpException::default(e.to_string()))?;
+    cid_frame_zval(cid, bytes)
+}
+
+/// 把（cid, frame bytes）打包成 `['cid' => int, 'frame' => binary]`。
+/// 接 `Vec<u8>` 而非 `&[u8]` 是为了直接 move 进 Binary，避免一次 to_vec 拷贝。
+fn cid_frame_zval(cid: u64, bytes: Vec<u8>) -> PhpResult<Zval> {
     let mut ht = ZendHashTable::new();
     ht.insert("cid", cid as i64)
         .map_err(|e| PhpException::default(format!("cid: {e}")))?;
-    ht.insert("frame", bytes_to_php_string(bytes).as_str())
+    ht.insert("frame", Binary::<u8>::from(bytes))
         .map_err(|e| PhpException::default(format!("frame: {e}")))?;
     ht.into_zval(false)
         .map_err(|e| PhpException::default(format!("into_zval: {e}")))
@@ -769,13 +985,23 @@ fn put<V: IntoZval>(ht: &mut ZendHashTable, key: &str, value: V) -> PhpResult<()
         .map_err(|e| PhpException::default(format!("{key}: {e}")))
 }
 
-/// MINIT 钩子：注册 hi_kafka.* 三项 ini 给运维侧用。
-extern "C" fn module_startup(_type: i32, module_number: i32) -> i32 {
+/// MINIT 钩子：注册 hi_kafka.* 几项 ini 给运维侧用。
+///
+/// X：必须用 `#[php_startup]` 而不是手动 `.startup_function(...)`。
+/// 原因：ext-php-rs 0.13 检测到 `#[php_class]` 时会自动生成一个 startup 函数注册类；
+/// 用户手动 `module.startup_function(fn)` 会覆盖那个自动 startup，导致 `Hi\Kafka\Client`
+/// 这种 `#[php_class]` 类不被注册（PHP 端 `class_exists("Hi\\Kafka\\Client") === false`）。
+/// 正确用法是把业务 ini 注册逻辑放进 `#[php_startup]` 标记的函数体内——宏会把它
+/// **合并**进 class 注册的同一个 startup 里。
+///
+/// 函数体里 `module_number` 是宏内部 `fn internal(ty, module_number)` 的参数名，
+/// 直接引用即可（不需要在签名里声明）。
+#[php_startup]
+fn module_startup() {
     ini_config::register(module_number);
-    0
 }
 
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
-    module.startup_function(module_startup)
+    module
 }

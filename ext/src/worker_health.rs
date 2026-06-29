@@ -20,17 +20,34 @@ fn cache() -> &'static Mutex<HashMap<PathBuf, ()>> {
     KNOWN_ALIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 确保 worker 就绪。命中缓存则零开销直接返回。
-pub fn ensure(socket: &str) -> Result<(), spawn::SpawnError> {
+/// L: 调用结果——区分"缓存命中"和"刚 spawn"，让上层 ipc::ensure 在新 worker 出现时
+/// 触发 cluster_replay。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureOutcome {
+    /// 缓存已知 alive，直接 fast-path 返回
+    AlreadyAlive,
+    /// 本次调用拉起或确认了一个 worker（cache miss 路径）。
+    /// 调用方应认为它可能是全新 worker，需要重放 cluster 注册。
+    JustSpawned,
+}
+
+/// 确保 worker 就绪。
+/// - cache hit → `AlreadyAlive` 零开销
+/// - cache miss → 调 `spawn::ensure_worker`，根据其返回值决定 `AlreadyAlive`
+///   还是 `JustSpawned`（区分"worker 还活着只是缓存丢"和"真新 spawn"）
+pub fn ensure(socket: &str) -> Result<EnsureOutcome, spawn::SpawnError> {
     let key = PathBuf::from(socket);
     if cache().lock().unwrap().contains_key(&key) {
-        return Ok(());
+        return Ok(EnsureOutcome::AlreadyAlive);
     }
 
     let cfg = spawn::SpawnConfig::from_env(key.clone());
-    spawn::ensure_worker(&cfg)?;
+    let outcome = spawn::ensure_worker(&cfg)?;
     cache().lock().unwrap().insert(key, ());
-    Ok(())
+    Ok(match outcome {
+        spawn::SpawnOutcome::AlreadyAlive => EnsureOutcome::AlreadyAlive,
+        spawn::SpawnOutcome::JustSpawned => EnsureOutcome::JustSpawned,
+    })
 }
 
 /// 标记某 socket 的 worker 状态为未知（IO 失败时调用）。

@@ -15,11 +15,14 @@
 //! 与 SkyWalking PHP 的 `OnceCell<Mutex<UnixStream>>` 单连接相比：
 //! 多协程并发时本池的等待时间更小（每协程独占一个连接，无 mutex 排队）。
 
+use crate::protocol;
+use hi_kafka_proto::HEADER_LEN;
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
@@ -28,6 +31,9 @@ pub enum PoolError {
         socket: String,
         source: std::io::Error,
     },
+
+    #[error("handshake {socket}: {reason}")]
+    Handshake { socket: String, reason: String },
 }
 
 const DEFAULT_MAX_IDLE: usize = 16;
@@ -95,10 +101,18 @@ impl ConnectionPool {
 
         // 池空 → 新建
         self.stats.lock().unwrap().misses_total += 1;
-        let stream = UnixStream::connect(&self.socket).map_err(|e| PoolError::Connect {
+        let mut stream = UnixStream::connect(&self.socket).map_err(|e| PoolError::Connect {
             socket: self.socket.display().to_string(),
             source: e,
         })?;
+        // F: 同步握手——双端 PROTOCOL_MAJOR 不一致就拒绝连接，
+        // 避免字段错位静默解码出垃圾值
+        if let Err(reason) = handshake(&mut stream) {
+            return Err(PoolError::Handshake {
+                socket: self.socket.display().to_string(),
+                reason,
+            });
+        }
         Ok(PooledConn {
             stream: Some(stream),
             pool: Arc::clone(self),
@@ -113,6 +127,45 @@ impl ConnectionPool {
         }
         // 超过 max_idle 直接丢弃
     }
+}
+
+/// F: 同步 HELLO 握手。新建 UDS 连接后立即跑——任一步失败 → 调用方关连接。
+/// 帧的编/解码逻辑下沉到 [`crate::protocol`]，本函数只管 IO + timeout。
+fn handshake(stream: &mut UnixStream) -> Result<(), String> {
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let frame = protocol::build_hello_frame().map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|e| format!("set_write_timeout: {e}"))?;
+    stream
+        .write_all(&frame)
+        .and_then(|_| stream.flush())
+        .map_err(|e| format!("write HELLO: {e}"))?;
+
+    stream
+        .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    let mut header_buf = [0u8; HEADER_LEN];
+    stream
+        .read_exact(&mut header_buf)
+        .map_err(|e| format!("read HELLO RESP header: {e}"))?;
+    // HELLO RESP payload 长度从 header 第 0..4 字节读
+    let payload_len =
+        u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]) as usize;
+    let mut resp_payload = vec![0u8; payload_len];
+    stream
+        .read_exact(&mut resp_payload)
+        .map_err(|e| format!("read HELLO RESP payload: {e}"))?;
+    let mut full = Vec::with_capacity(HEADER_LEN + payload_len);
+    full.extend_from_slice(&header_buf);
+    full.extend_from_slice(&resp_payload);
+    protocol::parse_hello_resp(&full).map_err(|e| e.to_string())?;
+
+    // 还原默认 timeout 让后续业务调用按需重设
+    let _ = stream.set_write_timeout(None);
+    let _ = stream.set_read_timeout(None);
+    Ok(())
 }
 
 /// 探测连接是否还活着。
@@ -187,20 +240,14 @@ pub fn pool_for(socket: &Path) -> Arc<ConnectionPool> {
 pub fn all_stats() -> Vec<(PathBuf, PoolStats, usize, usize)> {
     let map = pools().lock().unwrap();
     map.iter()
-        .map(|(path, pool)| {
-            (
-                path.clone(),
-                pool.stats(),
-                pool.idle_count(),
-                pool.max_idle,
-            )
-        })
+        .map(|(path, pool)| (path.clone(), pool.stats(), pool.idle_count(), pool.max_idle))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hi_kafka_proto::{FrameType, PROTOCOL_MAJOR};
     use std::io::Write;
     use std::os::unix::net::UnixListener;
     use std::thread;
@@ -219,14 +266,30 @@ mod tests {
         p
     }
 
-    /// 在后台跑一个简单的 echo server 用于测试。
+    /// fake worker：HELLO 帧固定 14B（13B header + 1B payload），裸字节
+    /// 读+写完就挂。比走 codec/encode_frame 更直接。
     fn spawn_echo_server(socket: &Path) -> thread::JoinHandle<()> {
         let socket = socket.to_path_buf();
         thread::spawn(move || {
             let listener = UnixListener::bind(&socket).expect("bind");
             for incoming in listener.incoming() {
                 if let Ok(mut s) = incoming {
-                    let _ = s.write_all(b"x");
+                    thread::spawn(move || {
+                        let mut req = [0u8; HEADER_LEN + 1];
+                        if (&s).read_exact(&mut req).is_err() {
+                            return;
+                        }
+                        // RESP: payload_len=1, kind=Hello, cid=echo req cid
+                        let mut resp = [0u8; HEADER_LEN + 1];
+                        resp[..4].copy_from_slice(&1u32.to_be_bytes());
+                        resp[4] = FrameType::Hello as u8;
+                        resp[5..13].copy_from_slice(&req[5..13]);
+                        resp[13] = PROTOCOL_MAJOR;
+                        let _ = s.write_all(&resp);
+                        // 挂着等客户端 close
+                        let mut sink = [0u8; 64];
+                        while (&s).read(&mut sink).map(|n| n > 0).unwrap_or(false) {}
+                    });
                 }
             }
         })

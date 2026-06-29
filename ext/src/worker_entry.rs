@@ -19,7 +19,7 @@ use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -59,6 +59,23 @@ pub unsafe fn run_in_child(config: ChildConfig) -> ! {
         // 由后续 PHP 进程通过 UDS 复用，不被 PID 1 杀掉
     }
 
+    // Y1: macOS 上 `prctl` 不存在。
+    //
+    // 我们走 `pthread_setname_np` 改主线程名——Activity Monitor / Instruments /
+    // 调试器（lldb）能识别。**但 `ps -ef` 不行**：macOS kernel 给每个进程维护
+    // 独立的 procinfo commandline buffer，与 user-space 的 `_NSGetArgv()` 完全
+    // 隔离。覆盖 user-space argv[0] 字符串内存对 `ps -ef` 显示无效（实测验证）。
+    // Darwin 有 `proc_setname_np` 私有 SPI 但 Apple 不保证 ABI 稳定。
+    //
+    // 实际效果：macOS 上 `ps -ef` 看 worker 仍像 PHP 进程；运维定位时**用
+    // `pgrep -f /tmp/.*\.sock`** 按 socket 路径找，或用 `scripts/cleanup-ghosts.sh`
+    // 一键清理。
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let new_name = b"hi-kafka-worker\0";
+        libc::pthread_setname_np(new_name.as_ptr() as *const _);
+    }
+
     // 3. 重定向 stdio
     redirect_stdio(config.log_file.as_deref());
 
@@ -69,7 +86,9 @@ pub unsafe fn run_in_child(config: ChildConfig) -> ! {
 
     // 5. 初始化日志
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(true)
         .try_init();
 
@@ -105,7 +124,9 @@ pub unsafe fn run_in_child(config: ChildConfig) -> ! {
 }
 
 async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
-    use hi_kafka_worker::{Metrics, cluster::ClusterRegistry, metrics, server, shutdown::ShutdownState};
+    use hi_kafka_worker::{
+        cluster::ClusterRegistry, metrics, server, shutdown::ShutdownState, Metrics,
+    };
 
     let pid_file = pid_file_for(&config.socket);
     let _ = write_pid_file(&pid_file);
@@ -122,9 +143,9 @@ async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
     }
 
     let producer = build_producer(registry.clone());
-    let consumer = build_consumer(registry.clone());
     let shutdown = ShutdownState::new();
     let m = Metrics::new();
+    let consumer = build_consumer(registry.clone(), m.clone());
 
     if let Some(addr) = config.metrics_addr {
         let m_clone = m.clone();
@@ -224,26 +245,36 @@ fn redirect_stdio(log_file: Option<&std::path::Path>) {
 }
 
 #[cfg(feature = "kafka")]
-fn build_producer(registry: hi_kafka_worker::ClusterRegistryHandle) -> hi_kafka_worker::ProducerHandle {
+fn build_producer(
+    registry: hi_kafka_worker::ClusterRegistryHandle,
+) -> hi_kafka_worker::ProducerHandle {
     use hi_kafka_worker::producer::KafkaProducer;
     use std::sync::Arc;
     Arc::new(KafkaProducer::new(registry))
 }
 
 #[cfg(not(feature = "kafka"))]
-fn build_producer(_registry: hi_kafka_worker::ClusterRegistryHandle) -> hi_kafka_worker::ProducerHandle {
+fn build_producer(
+    _registry: hi_kafka_worker::ClusterRegistryHandle,
+) -> hi_kafka_worker::ProducerHandle {
     hi_kafka_worker::producer::logging()
 }
 
 #[cfg(feature = "kafka")]
-fn build_consumer(registry: hi_kafka_worker::ClusterRegistryHandle) -> hi_kafka_worker::ConsumerHandle {
+fn build_consumer(
+    registry: hi_kafka_worker::ClusterRegistryHandle,
+    metrics: std::sync::Arc<hi_kafka_worker::Metrics>,
+) -> hi_kafka_worker::ConsumerHandle {
     use hi_kafka_worker::consumer::{KafkaConsumer, KafkaConsumerConfig};
     use std::sync::Arc;
-    Arc::new(KafkaConsumer::new(registry, KafkaConsumerConfig::default()))
+    Arc::new(KafkaConsumer::new(registry, KafkaConsumerConfig::default()).with_metrics(metrics))
 }
 
 #[cfg(not(feature = "kafka"))]
-fn build_consumer(_registry: hi_kafka_worker::ClusterRegistryHandle) -> hi_kafka_worker::ConsumerHandle {
+fn build_consumer(
+    _registry: hi_kafka_worker::ClusterRegistryHandle,
+    _metrics: std::sync::Arc<hi_kafka_worker::Metrics>,
+) -> hi_kafka_worker::ConsumerHandle {
     hi_kafka_worker::consumer::logging()
 }
 

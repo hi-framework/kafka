@@ -41,17 +41,18 @@ impl Client {
         config: std::collections::HashMap<String, String>,
         timeout_ms: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(5000).max(1) as u64,
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         let cfg_vec: Vec<(String, String)> = config.into_iter().collect();
         ipc::register_cluster(&self.socket, cluster, cfg_vec, timeout)
             .map_err(|e| PhpException::default(e.to_string()))
     }
 
-    /// 显式拉起 worker（如果还没在跑）。命中缓存时零开销直接返回。
+    /// 显式拉起 worker（如果还没在跑）。
+    /// L: 强制 fresh probe（invalidate + ensure），死了就 spawn + replay cluster；
+    /// 活着就快速通过。保证"调完 ensureWorker 后下一行业务 RPC 不会再触发自愈"。
     pub fn ensure_worker(&self) -> PhpResult<()> {
-        worker_health::ensure(&self.socket)
+        worker_health::invalidate(&self.socket);
+        ipc::ensure(&self.socket)
             .map_err(|e| PhpException::default(format!("ensure_worker: {e}")))?;
         Ok(())
     }
@@ -85,9 +86,7 @@ impl Client {
         timestamp_ms: Option<i64>,
         timeout_ms: Option<i64>,
     ) -> PhpResult<Zval> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(5000).max(1) as u64,
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         let opts = super::build_options(Some(headers), partition, timestamp_ms);
         let resp = ipc::produce_sync(&self.socket, cluster, topic, key, value, opts, timeout)
             .map_err(|e| PhpException::default(e.to_string()))?;
@@ -139,9 +138,7 @@ impl Client {
         timestamp_ms: Option<i64>,
         timeout_ms: Option<i64>,
     ) -> PhpResult<Zval> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(5000).max(1) as u64,
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         let key_vec: Vec<u8> = key.into();
         let value_vec: Vec<u8> = value.into();
         let headers = super::build_binary_headers(header_names, header_values)
@@ -177,9 +174,7 @@ impl Client {
         config: Option<std::collections::HashMap<String, String>>,
         timeout_ms: Option<i64>,
     ) -> PhpResult<i64> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(5000).max(1) as u64,
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         let cfg_vec: Vec<(String, String)> = config.unwrap_or_default().into_iter().collect();
         let id = subscription::subscribe(&self.socket, cluster, group_id, topics, cfg_vec, timeout)
             .map_err(|e| PhpException::default(e.to_string()))?;
@@ -204,9 +199,7 @@ impl Client {
 
     /// 同步提交 offset。命中 subscription gone 时透明重订阅 + 重试。
     pub fn commit(&self, subscription_id: i64, timeout_ms: Option<i64>) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(5000).max(1) as u64,
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         subscription::commit(subscription_id as u64, timeout)
             .map_err(|e| PhpException::default(e.to_string()))
     }
@@ -222,27 +215,26 @@ impl Client {
     /// 跨多 topic 原子写入：begin → produce* → commit / abort。
     /// 同集群同时仅一个 active tx（librdkafka 内部串行）。
     pub fn begin_transaction(&self, cluster: &str, timeout_ms: Option<i64>) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(30_000).max(1) as u64,
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1) as u64);
         ipc::txn(&self.socket, cluster, hi_kafka_proto::TxnOp::Begin, timeout)
             .map_err(|e| PhpException::default(e.to_string()))
     }
 
     /// 提交事务。原子写入所有 in-flight 消息。
     pub fn commit_transaction(&self, cluster: &str, timeout_ms: Option<i64>) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(30_000).max(1) as u64,
-        );
-        ipc::txn(&self.socket, cluster, hi_kafka_proto::TxnOp::Commit, timeout)
-            .map_err(|e| PhpException::default(e.to_string()))
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1) as u64);
+        ipc::txn(
+            &self.socket,
+            cluster,
+            hi_kafka_proto::TxnOp::Commit,
+            timeout,
+        )
+        .map_err(|e| PhpException::default(e.to_string()))
     }
 
     /// 回滚事务。in-flight 消息从 `read_committed` consumer 不可见。
     pub fn abort_transaction(&self, cluster: &str, timeout_ms: Option<i64>) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(30_000).max(1) as u64,
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1) as u64);
         ipc::txn(&self.socket, cluster, hi_kafka_proto::TxnOp::Abort, timeout)
             .map_err(|e| PhpException::default(e.to_string()))
     }
@@ -261,9 +253,7 @@ impl Client {
         offsets: Vec<i64>,
         timeout_ms: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(10_000).max(1) as u64,
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(10_000).max(1) as u64);
         let parsed = super::build_offset_targets(topics, partitions, offsets)
             .map_err(PhpException::default)?;
         ipc::seek_by_offset(&self.socket, subscription_id as u64, parsed, timeout)
@@ -281,11 +271,9 @@ impl Client {
         partitions: Vec<i64>,
         timeout_ms: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(15_000).max(1) as u64,
-        );
-        let parsed = super::build_partition_specs(topics, partitions)
-            .map_err(PhpException::default)?;
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(15_000).max(1) as u64);
+        let parsed =
+            super::build_partition_specs(topics, partitions).map_err(PhpException::default)?;
         ipc::seek_by_timestamp(
             &self.socket,
             subscription_id as u64,
@@ -317,9 +305,7 @@ impl Client {
         extensions: std::collections::HashMap<String, String>,
         timeout_ms: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(5000).max(1) as u64,
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         let ext_vec: Vec<(String, String)> = extensions.into_iter().collect();
         ipc::set_oauth_bearer_token(
             &self.socket,
@@ -349,11 +335,9 @@ impl Client {
         partitions: Vec<i64>,
         timeout_ms: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(5000).max(1) as u64,
-        );
-        let parsed = super::build_partition_specs(topics, partitions)
-            .map_err(PhpException::default)?;
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
+        let parsed =
+            super::build_partition_specs(topics, partitions).map_err(PhpException::default)?;
         ipc::pause_resume(
             &self.socket,
             subscription_id as u64,
@@ -372,11 +356,9 @@ impl Client {
         partitions: Vec<i64>,
         timeout_ms: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(5000).max(1) as u64,
-        );
-        let parsed = super::build_partition_specs(topics, partitions)
-            .map_err(PhpException::default)?;
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
+        let parsed =
+            super::build_partition_specs(topics, partitions).map_err(PhpException::default)?;
         ipc::pause_resume(
             &self.socket,
             subscription_id as u64,
@@ -410,9 +392,7 @@ impl Client {
         offsets: Vec<i64>,
         timeout_ms: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(30_000).max(1) as u64,
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1) as u64);
         let parsed = super::build_offset_targets(topics, partitions, offsets)
             .map_err(PhpException::default)?;
         ipc::send_offsets_to_transaction(
@@ -441,9 +421,7 @@ impl Client {
         timeout_ms: Option<i64>,
     ) -> PhpResult<Zval> {
         let max = max_events.unwrap_or(100).max(1) as u32;
-        let timeout = std::time::Duration::from_millis(
-            timeout_ms.unwrap_or(5000).max(1) as u64,
-        );
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         let events = ipc::poll_rebalance(&self.socket, subscription_id as u64, max, timeout)
             .map_err(|e| PhpException::default(e.to_string()))?;
         super::rebalance_events_to_zval(events)

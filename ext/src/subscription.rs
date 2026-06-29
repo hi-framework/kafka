@@ -80,7 +80,14 @@ pub fn subscribe(
     config: Vec<(String, String)>,
     timeout: Duration,
 ) -> Result<u64, IpcError> {
-    let real_id = ipc::subscribe(socket, cluster, group_id, topics.clone(), config.clone(), timeout)?;
+    let real_id = ipc::subscribe(
+        socket,
+        cluster,
+        group_id,
+        topics.clone(),
+        config.clone(),
+        timeout,
+    )?;
     let virt = NEXT_VIRTUAL.fetch_add(1, Ordering::Relaxed);
     registry().lock().unwrap().insert(
         virt,
@@ -138,9 +145,9 @@ where
     // 取当前 entry 的拷贝（最小持锁时间）
     let mut snap = {
         let reg = registry().lock().unwrap();
-        reg.get(&virtual_id)
-            .cloned()
-            .ok_or_else(|| IpcError::Server(format!("virtual subscription {virtual_id} not found")))?
+        reg.get(&virtual_id).cloned().ok_or_else(|| {
+            IpcError::Server(format!("virtual subscription {virtual_id} not found"))
+        })?
     };
 
     match op(&snap) {
