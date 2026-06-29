@@ -1,0 +1,29 @@
+{
+    "name": "hi/kafka-driver",
+    "description": "PHP-level coroutine drivers + stubs for hi-kafka-ext (Swoole + Swow)",
+    "type": "library",
+    "license": "Apache-2.0",
+    "require": {
+        "php": ">=8.2"
+    },
+    "suggest": {
+        "ext-hi-kafka": "Real runtime implementation; without it, Client falls back to no-op stubs (IDE / CI only)",
+        "ext-swoole": "Required for Hi\\Kafka\\SwooleClient",
+        "ext-swow": "Required for Hi\\Kafka\\SwowClient"
+    },
+    "autoload": {
+        "psr-4": {
+            "Hi\\Kafka\\": "php-driver/src/Hi/Kafka/"
+        },
+        "files": [
+            "php-driver/stubs/hi_kafka_functions.php"
+        ]
+    },
+    "extra": {
+        "phpstan": {
+            "includes": [
+                "php-driver/stubs/hi_kafka_functions.php"
+            ]
+        }
+    }
+}
