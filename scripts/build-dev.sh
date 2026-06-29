@@ -5,15 +5,21 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PROFILE="${PROFILE:-debug}"
-CARGO_FLAGS=()
+# 用 string + word-splitting 而非 array，避开 macOS bash 3.2 下
+# `set -u` + 空 array `[@]` 展开 "unbound variable" 报错。
+# 这里 flag 只可能是单 token `--release`，没空格安全。
+CARGO_FLAGS=""
 if [[ "$PROFILE" == "release" ]]; then
-    CARGO_FLAGS+=("--release")
+    CARGO_FLAGS="--release"
 fi
 
 echo "==> cargo build ($PROFILE)"
-cargo build -p hi-kafka-proto "${CARGO_FLAGS[@]}"
-cargo build -p hi-kafka-worker "${CARGO_FLAGS[@]}"
-cargo build -p hi-kafka "${CARGO_FLAGS[@]}"
+# shellcheck disable=SC2086
+cargo build -p hi-kafka-proto $CARGO_FLAGS
+# shellcheck disable=SC2086
+cargo build -p hi-kafka-worker $CARGO_FLAGS
+# shellcheck disable=SC2086
+cargo build -p hi-kafka $CARGO_FLAGS
 
 TARGET_DIR="target/$PROFILE"
 
