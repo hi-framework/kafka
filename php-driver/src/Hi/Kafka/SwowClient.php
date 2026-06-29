@@ -227,6 +227,180 @@ final class SwowClient
         }
     }
 
+    // === Phase 3.x methods ====================================================
+
+    /**
+     * 暂停一组分区的 fetch（不丢分区分配，不触发 rebalance）。空数组 = 当前 assignment 全部。
+     *
+     * @param string[] $topics
+     * @param int[]    $partitions
+     */
+    public function pause(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void
+    {
+        $encoded = hi_kafka_encode_pause_resume_frame($subscriptionId, 0, $topics, $partitions);
+        $resp = $this->roundTrip($encoded['cid'], $encoded['frame'], $timeoutMs);
+        if (! $resp['ok']) {
+            throw new \RuntimeException("pause failed: {$resp['message']}");
+        }
+    }
+
+    /**
+     * 恢复被 pause 暂停的分区。
+     *
+     * @param string[] $topics
+     * @param int[]    $partitions
+     */
+    public function resume(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void
+    {
+        $encoded = hi_kafka_encode_pause_resume_frame($subscriptionId, 1, $topics, $partitions);
+        $resp = $this->roundTrip($encoded['cid'], $encoded['frame'], $timeoutMs);
+        if (! $resp['ok']) {
+            throw new \RuntimeException("resume failed: {$resp['message']}");
+        }
+    }
+
+    /**
+     * 按 offset seek。必须在订阅已 ASSIGN 后调。三个平行数组同长度。
+     *
+     * @param string[] $topics
+     * @param int[]    $partitions
+     * @param int[]    $offsets
+     */
+    public function seek(int $subscriptionId, array $topics, array $partitions, array $offsets, int $timeoutMs = 10000): void
+    {
+        $encoded = hi_kafka_encode_seek_by_offset_frame($subscriptionId, $topics, $partitions, $offsets);
+        $resp = $this->roundTrip($encoded['cid'], $encoded['frame'], $timeoutMs);
+        if (! $resp['ok']) {
+            throw new \RuntimeException("seek failed: {$resp['message']}");
+        }
+    }
+
+    /**
+     * 按时间戳 seek。$topics/$partitions 均空 = 应用到当前 assignment 全部分区。
+     *
+     * @param string[] $topics
+     * @param int[]    $partitions
+     */
+    public function seekToTimestamp(
+        int $subscriptionId,
+        int $timestampMs,
+        array $topics,
+        array $partitions,
+        int $timeoutMs = 15000,
+    ): void {
+        $encoded = hi_kafka_encode_seek_by_timestamp_frame(
+            $subscriptionId,
+            $timestampMs,
+            $topics,
+            $partitions
+        );
+        $resp = $this->roundTrip($encoded['cid'], $encoded['frame'], $timeoutMs);
+        if (! $resp['ok']) {
+            throw new \RuntimeException("seekToTimestamp failed: {$resp['message']}");
+        }
+    }
+
+    /**
+     * 开启事务。集群配置必须含 `transactional.id`。
+     */
+    public function beginTransaction(string $cluster, int $timeoutMs = 30000): void
+    {
+        $encoded = hi_kafka_encode_txn_frame($cluster, 0);
+        $resp = $this->roundTrip($encoded['cid'], $encoded['frame'], $timeoutMs);
+        if (! $resp['ok']) {
+            throw new \RuntimeException("beginTransaction failed: {$resp['message']}");
+        }
+    }
+
+    public function commitTransaction(string $cluster, int $timeoutMs = 30000): void
+    {
+        $encoded = hi_kafka_encode_txn_frame($cluster, 1);
+        $resp = $this->roundTrip($encoded['cid'], $encoded['frame'], $timeoutMs);
+        if (! $resp['ok']) {
+            throw new \RuntimeException("commitTransaction failed: {$resp['message']}");
+        }
+    }
+
+    public function abortTransaction(string $cluster, int $timeoutMs = 30000): void
+    {
+        $encoded = hi_kafka_encode_txn_frame($cluster, 2);
+        $resp = $this->roundTrip($encoded['cid'], $encoded['frame'], $timeoutMs);
+        if (! $resp['ok']) {
+            throw new \RuntimeException("abortTransaction failed: {$resp['message']}");
+        }
+    }
+
+    /**
+     * EOS：把 consumer offsets 提交进当前 producer 事务。
+     *
+     * @param string[] $topics
+     * @param int[]    $partitions
+     * @param int[]    $offsets
+     */
+    public function sendOffsetsToTransaction(
+        string $producerCluster,
+        int $subscriptionId,
+        string $groupId,
+        array $topics,
+        array $partitions,
+        array $offsets,
+        int $timeoutMs = 30000,
+    ): void {
+        $encoded = hi_kafka_encode_send_offsets_frame(
+            $producerCluster,
+            $subscriptionId,
+            $groupId,
+            $topics,
+            $partitions,
+            $offsets
+        );
+        $resp = $this->roundTrip($encoded['cid'], $encoded['frame'], $timeoutMs);
+        if (! $resp['ok']) {
+            throw new \RuntimeException("sendOffsetsToTransaction failed: {$resp['message']}");
+        }
+    }
+
+    /**
+     * 推 SASL/OAUTHBEARER token 给指定 cluster。
+     *
+     * @param array<string,string> $extensions
+     */
+    public function setOAuthBearerToken(
+        string $cluster,
+        string $token,
+        int $lifetimeMs,
+        string $principalName,
+        array $extensions = [],
+        int $timeoutMs = 5000,
+    ): void {
+        $encoded = hi_kafka_encode_set_oauth_token_frame(
+            $cluster,
+            $token,
+            $lifetimeMs,
+            $principalName,
+            $extensions
+        );
+        $resp = $this->roundTrip($encoded['cid'], $encoded['frame'], $timeoutMs);
+        if (! $resp['ok']) {
+            throw new \RuntimeException("setOAuthBearerToken failed: {$resp['message']}");
+        }
+    }
+
+    /**
+     * 拉取 rebalance 事件队列。
+     *
+     * @return list<array{type:string, partitions?:list<array{topic:string,partition:int}>, message?:string}>
+     */
+    public function pollRebalanceEvents(int $subscriptionId, int $maxEvents = 100, int $timeoutMs = 5000): array
+    {
+        $encoded = hi_kafka_encode_poll_rebalance_frame($subscriptionId, $maxEvents);
+        $resp = $this->roundTrip($encoded['cid'], $encoded['frame'], $timeoutMs);
+        if (! $resp['ok']) {
+            throw new \RuntimeException("pollRebalanceEvents failed: {$resp['message']}");
+        }
+        return $resp['events'] ?? [];
+    }
+
     /**
      * 池统计。供监控/排障使用。
      *
@@ -328,8 +502,32 @@ final class SwowClient
                 $e,
             );
         }
+        // F: 协议 HELLO 握手——双端 PROTOCOL_MAJOR 不一致 worker 会关连接
+        try {
+            $this->handshake($conn);
+        } catch (\Throwable $e) {
+            $this->safeClose($conn);
+            throw new \RuntimeException(
+                "handshake {$this->socket} failed: " . $e->getMessage(),
+                0,
+                $e,
+            );
+        }
         $this->created++;
         return $conn;
+    }
+
+    private function handshake(Socket $conn): void
+    {
+        $frame = hi_kafka_encode_hello_frame();
+        $timeoutMs = 2000;
+        $conn->sendString($frame, $timeoutMs);
+        // HELLO RESP 固定 14B
+        $resp = $conn->recvStringData(14, $timeoutMs);
+        if (strlen($resp) < 14) {
+            throw new \RuntimeException('recv HELLO RESP short read');
+        }
+        hi_kafka_verify_hello_resp($resp);
     }
 
     private function safeClose(?Socket $conn): void
