@@ -25,7 +25,7 @@ trap cleanup EXIT
 cleanup  # 先清场
 
 KAFKA_CONTAINER="${KAFKA_CONTAINER:-hi-kafka-ext-kafka_kraft-1}"
-KAFKA_BIN="${KAFKA_BIN:-/opt/bitnami/kafka/bin}"
+KAFKA_BIN="${KAFKA_BIN:-/opt/kafka/bin}"
 BROKER="${BROKER:-localhost:9094}"
 USE_KAFKA="${USE_KAFKA:-1}"
 

@@ -54,6 +54,7 @@ ALL_TESTS=(
     configs
     consumer-in-txn
     consumer-recovery
+    control-recovery
     headers
     integration
     oauth-smoke
@@ -61,8 +62,10 @@ ALL_TESTS=(
     pause-resume
     rebalance
     recovery
+    replay-recovery
     seek
     swoole-client
+    swoole-phase3
     transaction
 )
 TESTS="${E2E_TESTS:-${ALL_TESTS[@]}}"
@@ -70,6 +73,27 @@ TESTS="${E2E_TESTS:-${ALL_TESTS[@]}}"
 green() { printf '\033[32m%s\033[0m' "$*"; }
 red()   { printf '\033[31m%s\033[0m' "$*"; }
 yellow() { printf '\033[33m%s\033[0m' "$*"; }
+
+# 每个测试用独立 socket；测试结束后必须主动杀 worker，否则它被 init 收养后会一直
+# 挂着（ps 里看是 'php' 因为 macOS 没 PR_SET_NAME 改不了 argv[0]）。
+# pid 文件由 worker 自己在 bind socket 后写入；recovery 类测试 kill 旧 worker 后
+# 新 worker 写新 pid。统一靠 pid 文件清理。
+cleanup_worker() {
+    local sock="$1"
+    if [[ -f "${sock}.pid" ]]; then
+        local pid
+        pid=$(cat "${sock}.pid" 2>/dev/null || true)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+            for _ in 1 2 3 4 5; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.2
+            done
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$sock" "${sock}.pid" "${sock}.spawn-lock"
+}
 
 pass=0
 fail=0
@@ -93,8 +117,8 @@ for t in $TESTS; do
     extra_php_opts=""
     case "$t" in
         integration) extra_args="--with-kafka" ;;
-        swoole-client)
-            # swoole-client 需要在 hi-kafka 之前装载 swoole 扩展
+        swoole-client|swoole-phase3)
+            # 需要在 hi-kafka 之前装载 swoole 扩展
             if [[ -z "$SWOOLE_SO" ]]; then
                 echo "$(yellow SKIP) (swoole.so 未找到，设 SWOOLE_SO_PATH 或装 swoole)"
                 continue
@@ -133,8 +157,8 @@ for t in $TESTS; do
         failed_tests+=("$t")
     fi
 
-    # 清理 socket
-    rm -f "$sock"
+    # 清理：杀 worker + 删 socket / pid / lock 文件
+    cleanup_worker "$sock"
 done
 
 global_end=$(date +%s)

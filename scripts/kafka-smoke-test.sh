@@ -10,7 +10,7 @@ LOG="/tmp/hi-kafka-real.log"
 TOPIC="hi-kafka-real-test-$$"
 BROKER="${BROKER:-localhost:9094}"
 KAFKA_CONTAINER="${KAFKA_CONTAINER:-hi-kafka-ext-kafka_kraft-1}"
-KAFKA_BIN="${KAFKA_BIN:-/opt/bitnami/kafka/bin}"
+KAFKA_BIN="${KAFKA_BIN:-/opt/kafka/bin}"
 EXT_PATH="$(realpath target/debug/libhi_kafka.dylib 2>/dev/null || realpath target/debug/libhi_kafka.so)"
 
 if [[ ! -f "$EXT_PATH" ]]; then
