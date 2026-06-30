@@ -1,5 +1,6 @@
 use crate::cluster::{ClusterRegistryHandle, StoredOAuthToken};
-use crate::consumer::{ConsumerHandle, SubscriptionId};
+use crate::consumer::{ConsumerError, ConsumerHandle, SubscriptionId};
+use crate::error::WorkerError;
 use crate::metrics::Metrics;
 use crate::producer::ProducerHandle;
 use crate::shutdown::ShutdownHandle;
@@ -7,7 +8,8 @@ use anyhow::Context;
 use bytes::BytesMut;
 use futures::FutureExt;
 use hi_kafka_proto::{
-    codec, encode_frame, CommitReq, CommitResp, DeliveryErr, FrameType, HelloReq, HelloResp,
+    codec, encode_frame, CommitReq, CommitResp, DeliveryAck, ErrorKind, ErrorResp, FrameType,
+    HelloReq, HelloResp,
     PauseResumeOp, PauseResumeReq, PauseResumeResp, PollRebalanceReq, PollRebalanceResp, PollReq,
     PollResp, ProduceFnf, ProduceReq, ProduceResp, RegisterClusterReq, RegisterClusterResp,
     SeekReq, SeekResp, SendOffsetsReq, SendOffsetsResp, SetOAuthBearerTokenReq,
@@ -30,6 +32,9 @@ pub struct Server {
     registry: ClusterRegistryHandle,
     shutdown: ShutdownHandle,
     metrics: Arc<Metrics>,
+    /// 无任何连接且持续空闲超过此时长 → worker 自动 drain 退出（解决主进程退出后
+    /// worker 残留）。`Duration::ZERO` = 禁用（常驻，旧行为）。
+    idle_timeout: Duration,
 }
 
 impl Server {
@@ -42,10 +47,12 @@ impl Server {
             registry,
             crate::shutdown::ShutdownState::new(),
             Metrics::new(),
+            Duration::ZERO,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn bind_with(
         socket: &Path,
         producer: ProducerHandle,
@@ -53,6 +60,7 @@ impl Server {
         registry: ClusterRegistryHandle,
         shutdown: ShutdownHandle,
         metrics: Arc<Metrics>,
+        idle_timeout: Duration,
     ) -> anyhow::Result<Self> {
         if socket.exists() {
             std::fs::remove_file(socket).context("remove stale socket")?;
@@ -69,6 +77,7 @@ impl Server {
             registry,
             shutdown,
             metrics,
+            idle_timeout,
         })
     }
 
@@ -82,6 +91,16 @@ impl Server {
     /// in-flight connection 把响应写回（超时强制 abort）才返回。
     pub async fn run(self, drain_timeout: Duration) -> anyhow::Result<()> {
         let mut tasks: JoinSet<()> = JoinSet::new();
+        let idle_timeout = self.idle_timeout;
+        let mut last_active = tokio::time::Instant::now();
+        // idle 检查间隔：idle_timeout 的 1/4，夹在 [1s, 30s]。禁用时给个无害的 30s。
+        let check_interval = if idle_timeout.is_zero() {
+            Duration::from_secs(30)
+        } else {
+            (idle_timeout / 4).clamp(Duration::from_secs(1), Duration::from_secs(30))
+        };
+        let mut idle_ticker = tokio::time::interval(check_interval);
+        idle_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = self.shutdown.wait_draining() => {
@@ -95,6 +114,7 @@ impl Server {
                     return Ok(());
                 }
                 res = self.listener.accept() => {
+                    last_active = tokio::time::Instant::now();
                     match res {
                         Ok((stream, _addr)) => {
                             debug!("client connected");
@@ -115,6 +135,21 @@ impl Server {
                         Err(e) => {
                             error!(error = ?e, "accept failed");
                         }
+                    }
+                }
+                _ = idle_ticker.tick(), if !idle_timeout.is_zero() => {
+                    // 清掉已结束的 connection task，才能准确判断"无连接"。
+                    reap_finished(&mut tasks);
+                    if tasks.is_empty() {
+                        // 没有任何活跃 / idle 连接（客户端连接池里的连接对应一个阻塞在
+                        // read 的 task；全部断开才会走到这里）。持续空闲超时则自退。
+                        if last_active.elapsed() >= idle_timeout {
+                            info!(?idle_timeout, "worker idle (no connections), self-terminating");
+                            self.shutdown.start_draining();
+                        }
+                    } else {
+                        // 还有 in-flight 连接 → 不算空闲，刷新计时基准。
+                        last_active = tokio::time::Instant::now();
                     }
                 }
             }
@@ -337,43 +372,10 @@ async fn dispatch_inner(
             write_frame(stream, FrameType::Pong, cid, &[]).await?;
         }
         FrameType::ProduceFnf => {
-            Metrics::inc(&metrics.produce_fnf_total);
-            if shutdown.is_draining() {
-                Metrics::inc(&metrics.frames_dropped_draining_total);
-                warn!(cid, "PRODUCE_FNF dropped: worker draining");
-                return Ok(());
-            }
-            match ProduceFnf::decode(payload) {
-                Ok(msg) => {
-                    let cluster = msg.cluster.clone();
-                    let topic = msg.topic.clone();
-                    if let Err(e) = producer.produce_fnf(msg).await {
-                        Metrics::inc(&metrics.produce_fnf_failed_total);
-                        warn!(cid, %cluster, %topic, error = ?e, "PRODUCE_FNF failed");
-                    }
-                }
-                Err(e) => {
-                    Metrics::inc(&metrics.produce_fnf_failed_total);
-                    warn!(cid, error = ?e, "PRODUCE_FNF payload decode failed");
-                }
-            }
+            handle_produce_fnf(stream, cid, payload, producer, shutdown, metrics).await?;
         }
         FrameType::ProduceReq => {
-            Metrics::inc(&metrics.produce_req_total);
-            if shutdown.is_draining() {
-                Metrics::inc(&metrics.frames_dropped_draining_total);
-                Metrics::inc(&metrics.produce_resp_err_total);
-                let resp = ProduceResp::Err(DeliveryErr {
-                    code: u16::MAX,
-                    message: "worker is draining".into(),
-                    retryable: true,
-                });
-                let mut buf = BytesMut::new();
-                resp.encode(&mut buf).context("encode shutdown resp")?;
-                write_frame(stream, FrameType::ProduceResp, cid, &buf).await?;
-                return Ok(());
-            }
-            handle_produce_req(stream, cid, payload, producer, metrics).await?;
+            handle_produce_req(stream, cid, payload, producer, shutdown, metrics).await?;
         }
         FrameType::SubscribeReq => {
             handle_subscribe(stream, cid, payload, consumer).await?;
@@ -421,22 +423,29 @@ async fn handle_subscribe(
     payload: &[u8],
     consumer: &ConsumerHandle,
 ) -> anyhow::Result<()> {
-    let resp = match SubscribeReq::decode(payload) {
-        Ok(req) => match consumer.subscribe(req).await {
-            Ok(sub) => SubscribeResp::Ok {
-                subscription_id: sub.0,
-            },
-            Err(e) => SubscribeResp::Err {
-                message: format!("subscribe: {e}"),
-            },
-        },
-        Err(e) => SubscribeResp::Err {
-            message: format!("payload decode: {e}"),
-        },
+    let req = match SubscribeReq::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
+        }
     };
-    let mut buf = BytesMut::new();
-    resp.encode(&mut buf).context("encode subscribe_resp")?;
-    write_frame(stream, FrameType::SubscribeResp, cid, &buf).await
+    match consumer.subscribe(req).await {
+        Ok(sub) => {
+            let mut buf = BytesMut::new();
+            SubscribeResp::Ok {
+                subscription_id: sub.0,
+            }
+            .encode(&mut buf)
+            .context("encode subscribe_resp")?;
+            write_frame(stream, FrameType::SubscribeResp, cid, &buf).await
+        }
+        Err(e) => write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
+    }
 }
 
 async fn handle_poll(
@@ -445,23 +454,28 @@ async fn handle_poll(
     payload: &[u8],
     consumer: &ConsumerHandle,
 ) -> anyhow::Result<()> {
-    let resp = match PollReq::decode(payload) {
-        Ok(req) => {
-            let sub = SubscriptionId(req.subscription_id);
-            match consumer.poll(sub, req.max_messages, req.timeout_ms).await {
-                Ok(messages) => PollResp::Ok { messages },
-                Err(e) => PollResp::Err {
-                    message: format!("poll: {e}"),
-                },
-            }
+    let req = match PollReq::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
         }
-        Err(e) => PollResp::Err {
-            message: format!("payload decode: {e}"),
-        },
     };
-    let mut buf = BytesMut::new();
-    resp.encode(&mut buf).context("encode poll_resp")?;
-    write_frame(stream, FrameType::PollResp, cid, &buf).await
+    let sub = SubscriptionId(req.subscription_id);
+    match consumer.poll(sub, req.max_messages, req.timeout_ms).await {
+        Ok(messages) => {
+            let mut buf = BytesMut::new();
+            PollResp::Ok { messages }
+                .encode(&mut buf)
+                .context("encode poll_resp")?;
+            write_frame(stream, FrameType::PollResp, cid, &buf).await
+        }
+        Err(e) => write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
+    }
 }
 
 async fn handle_commit(
@@ -470,23 +484,26 @@ async fn handle_commit(
     payload: &[u8],
     consumer: &ConsumerHandle,
 ) -> anyhow::Result<()> {
-    let resp = match CommitReq::decode(payload) {
-        Ok(req) => {
-            let sub = SubscriptionId(req.subscription_id);
-            match consumer.commit(sub).await {
-                Ok(()) => CommitResp::Ok,
-                Err(e) => CommitResp::Err {
-                    message: format!("commit: {e}"),
-                },
-            }
+    let req = match CommitReq::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
         }
-        Err(e) => CommitResp::Err {
-            message: format!("payload decode: {e}"),
-        },
     };
-    let mut buf = BytesMut::new();
-    resp.encode(&mut buf).context("encode commit_resp")?;
-    write_frame(stream, FrameType::CommitResp, cid, &buf).await
+    let sub = SubscriptionId(req.subscription_id);
+    match consumer.commit(sub).await {
+        Ok(()) => {
+            let mut buf = BytesMut::new();
+            CommitResp::Ok.encode(&mut buf).context("encode commit_resp")?;
+            write_frame(stream, FrameType::CommitResp, cid, &buf).await
+        }
+        Err(e) => write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
+    }
 }
 
 async fn handle_seek(
@@ -495,35 +512,38 @@ async fn handle_seek(
     payload: &[u8],
     consumer: &ConsumerHandle,
 ) -> anyhow::Result<()> {
-    let resp = match SeekReq::decode(payload) {
-        Ok(req) => {
-            let sub = SubscriptionId(req.subscription_id());
-            let r = match req {
-                SeekReq::ByOffset { targets, .. } => consumer.seek_by_offset(sub, targets).await,
-                SeekReq::ByTimestamp {
-                    timestamp_ms,
-                    partitions,
-                    ..
-                } => {
-                    consumer
-                        .seek_by_timestamp(sub, timestamp_ms, partitions)
-                        .await
-                }
-            };
-            match r {
-                Ok(()) => SeekResp::Ok,
-                Err(e) => SeekResp::Err {
-                    message: format!("{e:#}"),
-                },
-            }
+    let req = match SeekReq::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
         }
-        Err(e) => SeekResp::Err {
-            message: format!("payload decode: {e}"),
-        },
     };
-    let mut buf = BytesMut::new();
-    resp.encode(&mut buf).context("encode seek_resp")?;
-    write_frame(stream, FrameType::SeekResp, cid, &buf).await
+    let sub = SubscriptionId(req.subscription_id());
+    let r = match req {
+        SeekReq::ByOffset { targets, .. } => consumer.seek_by_offset(sub, targets).await,
+        SeekReq::ByTimestamp {
+            timestamp_ms,
+            partitions,
+            ..
+        } => {
+            consumer
+                .seek_by_timestamp(sub, timestamp_ms, partitions)
+                .await
+        }
+    };
+    match r {
+        Ok(()) => {
+            let mut buf = BytesMut::new();
+            SeekResp::Ok.encode(&mut buf).context("encode seek_resp")?;
+            write_frame(stream, FrameType::SeekResp, cid, &buf).await
+        }
+        Err(e) => write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
+    }
 }
 
 async fn handle_poll_rebalance(
@@ -532,24 +552,28 @@ async fn handle_poll_rebalance(
     payload: &[u8],
     consumer: &ConsumerHandle,
 ) -> anyhow::Result<()> {
-    let resp = match PollRebalanceReq::decode(payload) {
-        Ok(req) => {
-            let sub = SubscriptionId(req.subscription_id);
-            match consumer.fetch_rebalance_events(sub, req.max_events).await {
-                Ok(events) => PollRebalanceResp::Ok { events },
-                Err(e) => PollRebalanceResp::Err {
-                    message: format!("fetch_rebalance_events: {e}"),
-                },
-            }
+    let req = match PollRebalanceReq::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
         }
-        Err(e) => PollRebalanceResp::Err {
-            message: format!("payload decode: {e}"),
-        },
     };
-    let mut buf = BytesMut::new();
-    resp.encode(&mut buf)
-        .context("encode poll_rebalance_resp")?;
-    write_frame(stream, FrameType::PollRebalanceResp, cid, &buf).await
+    let sub = SubscriptionId(req.subscription_id);
+    match consumer.fetch_rebalance_events(sub, req.max_events).await {
+        Ok(events) => {
+            let mut buf = BytesMut::new();
+            PollRebalanceResp::Ok { events }
+                .encode(&mut buf)
+                .context("encode poll_rebalance_resp")?;
+            write_frame(stream, FrameType::PollRebalanceResp, cid, &buf).await
+        }
+        Err(e) => write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
+    }
 }
 
 async fn handle_txn(
@@ -558,33 +582,34 @@ async fn handle_txn(
     payload: &[u8],
     producer: &ProducerHandle,
 ) -> anyhow::Result<()> {
-    let resp = match TxnReq::decode(payload) {
-        Ok(req) => {
-            let r = match req.op {
-                TxnOp::Begin => producer.begin_transaction(&req.cluster).await,
-                TxnOp::Commit => producer.commit_transaction(&req.cluster).await,
-                TxnOp::Abort => producer.abort_transaction(&req.cluster).await,
-            };
-            match r {
-                Ok(()) => {
-                    info!(cluster = %req.cluster, op = ?req.op, "txn op ok");
-                    TxnResp::Ok
-                }
-                Err(e) => {
-                    warn!(cluster = %req.cluster, op = ?req.op, error = ?e, "txn op failed");
-                    TxnResp::Err {
-                        message: format!("{e:#}"),
-                    }
-                }
-            }
+    let req = match TxnReq::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
         }
-        Err(e) => TxnResp::Err {
-            message: format!("payload decode: {e}"),
-        },
     };
-    let mut buf = BytesMut::new();
-    resp.encode(&mut buf).context("encode txn_resp")?;
-    write_frame(stream, FrameType::TxnResp, cid, &buf).await
+    let r = match req.op {
+        TxnOp::Begin => producer.begin_transaction(&req.cluster).await,
+        TxnOp::Commit => producer.commit_transaction(&req.cluster).await,
+        TxnOp::Abort => producer.abort_transaction(&req.cluster).await,
+    };
+    match r {
+        Ok(()) => {
+            info!(cluster = %req.cluster, op = ?req.op, "txn op ok");
+            let mut buf = BytesMut::new();
+            TxnResp::Ok.encode(&mut buf).context("encode txn_resp")?;
+            write_frame(stream, FrameType::TxnResp, cid, &buf).await
+        }
+        Err(e) => {
+            warn!(cluster = %req.cluster, op = ?req.op, error = ?e, "txn op failed");
+            write_error_frame(stream, cid, WorkerError::from_anyhow(&e)).await
+        }
+    }
 }
 
 async fn handle_set_oauth_token(
@@ -593,37 +618,41 @@ async fn handle_set_oauth_token(
     payload: &[u8],
     registry: &ClusterRegistryHandle,
 ) -> anyhow::Result<()> {
-    let resp = match SetOAuthBearerTokenReq::decode(payload) {
-        Ok(req) => {
-            let token = StoredOAuthToken {
-                token_value: req.token_value,
-                lifetime_ms: req.lifetime_ms,
-                principal_name: req.principal_name,
-                extensions: req.extensions,
-            };
-            match registry.set_oauth_token(&req.cluster, token).await {
-                Ok(()) => {
-                    info!(
-                        cluster = %req.cluster,
-                        lifetime_ms = req.lifetime_ms,
-                        "OAuth token updated"
-                    );
-                    SetOAuthBearerTokenResp::Ok
-                }
-                Err(msg) => {
-                    warn!(cluster = %req.cluster, error = %msg, "set_oauth_token failed");
-                    SetOAuthBearerTokenResp::Err { message: msg }
-                }
-            }
+    let req = match SetOAuthBearerTokenReq::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
         }
-        Err(e) => SetOAuthBearerTokenResp::Err {
-            message: format!("payload decode: {e}"),
-        },
     };
-    let mut buf = BytesMut::new();
-    resp.encode(&mut buf)
-        .context("encode set_oauth_token_resp")?;
-    write_frame(stream, FrameType::SetOAuthBearerTokenResp, cid, &buf).await
+    let cluster = req.cluster.clone();
+    let lifetime_ms = req.lifetime_ms;
+    let token = StoredOAuthToken {
+        token_value: req.token_value,
+        lifetime_ms: req.lifetime_ms,
+        principal_name: req.principal_name,
+        extensions: req.extensions,
+    };
+    match registry.set_oauth_token(&cluster, token).await {
+        Ok(()) => {
+            info!(%cluster, lifetime_ms, "OAuth token updated");
+            let mut buf = BytesMut::new();
+            SetOAuthBearerTokenResp::Ok
+                .encode(&mut buf)
+                .context("encode set_oauth_token_resp")?;
+            write_frame(stream, FrameType::SetOAuthBearerTokenResp, cid, &buf).await
+        }
+        Err(msg) => {
+            warn!(%cluster, error = %msg, "set_oauth_token failed");
+            // set_oauth_token 失败基本是目标 cluster 尚未注册
+            write_error_frame(stream, cid, ErrorResp::new(ErrorKind::ClusterNotRegistered, msg))
+                .await
+        }
+    }
 }
 
 async fn handle_pause_resume(
@@ -632,34 +661,37 @@ async fn handle_pause_resume(
     payload: &[u8],
     consumer: &ConsumerHandle,
 ) -> anyhow::Result<()> {
-    let resp = match PauseResumeReq::decode(payload) {
-        Ok(req) => {
-            let sub = SubscriptionId(req.subscription_id);
-            let count = req.partitions.len();
-            let r = match req.op {
-                PauseResumeOp::Pause => consumer.pause(sub, req.partitions).await,
-                PauseResumeOp::Resume => consumer.resume(sub, req.partitions).await,
-            };
-            match r {
-                Ok(()) => {
-                    debug!(?sub, op = ?req.op, count, "pause/resume ok");
-                    PauseResumeResp::Ok
-                }
-                Err(e) => {
-                    warn!(?sub, op = ?req.op, error = ?e, "pause/resume failed");
-                    PauseResumeResp::Err {
-                        message: format!("{e:#}"),
-                    }
-                }
-            }
+    let req = match PauseResumeReq::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
         }
-        Err(e) => PauseResumeResp::Err {
-            message: format!("payload decode: {e}"),
-        },
     };
-    let mut buf = BytesMut::new();
-    resp.encode(&mut buf).context("encode pause_resume_resp")?;
-    write_frame(stream, FrameType::PauseResumeResp, cid, &buf).await
+    let sub = SubscriptionId(req.subscription_id);
+    let count = req.partitions.len();
+    let r = match req.op {
+        PauseResumeOp::Pause => consumer.pause(sub, req.partitions).await,
+        PauseResumeOp::Resume => consumer.resume(sub, req.partitions).await,
+    };
+    match r {
+        Ok(()) => {
+            debug!(?sub, op = ?req.op, count, "pause/resume ok");
+            let mut buf = BytesMut::new();
+            PauseResumeResp::Ok
+                .encode(&mut buf)
+                .context("encode pause_resume_resp")?;
+            write_frame(stream, FrameType::PauseResumeResp, cid, &buf).await
+        }
+        Err(e) => {
+            warn!(?sub, op = ?req.op, error = ?e, "pause/resume failed");
+            write_error_frame(stream, cid, consumer_err_to_resp(&e)).await
+        }
+    }
 }
 
 async fn handle_send_offsets(
@@ -669,57 +701,52 @@ async fn handle_send_offsets(
     producer: &ProducerHandle,
     consumer: &ConsumerHandle,
 ) -> anyhow::Result<()> {
-    let resp = match SendOffsetsReq::decode(payload) {
-        Ok(req) => {
-            let sub = SubscriptionId(req.subscription_id);
-            // 1) 拿 group_metadata
-            match consumer.group_metadata(sub).await {
-                Ok(metadata) => {
-                    // 2) 调 producer 把 offsets 提交进当前事务
-                    match producer
-                        .send_offsets_to_transaction(
-                            &req.producer_cluster,
-                            &req.group_id,
-                            req.offsets,
-                            metadata,
-                        )
-                        .await
-                    {
-                        Ok(()) => {
-                            info!(
-                                cluster = %req.producer_cluster,
-                                group_id = %req.group_id,
-                                ?sub,
-                                "send_offsets_to_transaction ok"
-                            );
-                            SendOffsetsResp::Ok
-                        }
-                        Err(e) => {
-                            warn!(
-                                cluster = %req.producer_cluster,
-                                group_id = %req.group_id,
-                                ?sub,
-                                error = ?e,
-                                "send_offsets_to_transaction failed"
-                            );
-                            SendOffsetsResp::Err {
-                                message: format!("{e:#}"),
-                            }
-                        }
-                    }
-                }
-                Err(e) => SendOffsetsResp::Err {
-                    message: format!("group_metadata: {e}"),
-                },
-            }
+    let req = match SendOffsetsReq::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
         }
-        Err(e) => SendOffsetsResp::Err {
-            message: format!("payload decode: {e}"),
-        },
     };
-    let mut buf = BytesMut::new();
-    resp.encode(&mut buf).context("encode send_offsets_resp")?;
-    write_frame(stream, FrameType::SendOffsetsResp, cid, &buf).await
+    let sub = SubscriptionId(req.subscription_id);
+    // 1) 拿 group_metadata（subscription 不存在 → SUBSCRIPTION_NOT_FOUND，触发自愈）
+    let metadata = match consumer.group_metadata(sub).await {
+        Ok(m) => m,
+        Err(e) => return write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
+    };
+    // 2) 调 producer 把 offsets 提交进当前事务
+    match producer
+        .send_offsets_to_transaction(&req.producer_cluster, &req.group_id, req.offsets, metadata)
+        .await
+    {
+        Ok(()) => {
+            info!(
+                cluster = %req.producer_cluster,
+                group_id = %req.group_id,
+                ?sub,
+                "send_offsets_to_transaction ok"
+            );
+            let mut buf = BytesMut::new();
+            SendOffsetsResp::Ok
+                .encode(&mut buf)
+                .context("encode send_offsets_resp")?;
+            write_frame(stream, FrameType::SendOffsetsResp, cid, &buf).await
+        }
+        Err(e) => {
+            warn!(
+                cluster = %req.producer_cluster,
+                group_id = %req.group_id,
+                ?sub,
+                error = ?e,
+                "send_offsets_to_transaction failed"
+            );
+            write_error_frame(stream, cid, WorkerError::from_anyhow(&e)).await
+        }
+    }
 }
 
 async fn handle_register_cluster(
@@ -728,28 +755,35 @@ async fn handle_register_cluster(
     payload: &[u8],
     registry: &ClusterRegistryHandle,
 ) -> anyhow::Result<()> {
-    let resp = match RegisterClusterReq::decode(payload) {
-        Ok(req) => {
-            let cluster = req.cluster.clone();
-            let config: std::collections::HashMap<_, _> = req.config.into_iter().collect();
-            if !config.contains_key("bootstrap.servers") {
-                RegisterClusterResp::Err {
-                    message: format!(
-                        "cluster '{cluster}': missing required key 'bootstrap.servers'"
-                    ),
-                }
-            } else {
-                let added = registry.register(cluster.clone(), config).await;
-                info!(%cluster, added, "cluster registered");
-                RegisterClusterResp::Ok
-            }
+    let req = match RegisterClusterReq::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
         }
-        Err(e) => RegisterClusterResp::Err {
-            message: format!("payload decode: {e}"),
-        },
     };
+    let cluster = req.cluster.clone();
+    let config: std::collections::HashMap<_, _> = req.config.into_iter().collect();
+    if !config.contains_key("bootstrap.servers") {
+        return write_error_frame(
+            stream,
+            cid,
+            ErrorResp::new(
+                ErrorKind::InvalidArgument,
+                format!("cluster '{cluster}': missing required key 'bootstrap.servers'"),
+            ),
+        )
+        .await;
+    }
+    let added = registry.register(cluster.clone(), config).await;
+    info!(%cluster, added, "cluster registered");
     let mut buf = BytesMut::new();
-    resp.encode(&mut buf)
+    RegisterClusterResp::Ok
+        .encode(&mut buf)
         .context("encode register_cluster_resp")?;
     write_frame(stream, FrameType::RegisterClusterResp, cid, &buf).await
 }
@@ -781,10 +815,11 @@ async fn handle_produce_req(
     cid: u64,
     payload: &[u8],
     producer: &ProducerHandle,
+    shutdown: &ShutdownHandle,
     metrics: &Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let result = AssertUnwindSafe(handle_produce_req_inner(
-        stream, cid, payload, producer, metrics,
+        stream, cid, payload, producer, shutdown, metrics,
     ))
     .catch_unwind()
     .await;
@@ -794,16 +829,71 @@ async fn handle_produce_req(
             let msg = describe_panic(&panic);
             error!(cid, panic = %msg, "handle_produce_req panicked, attempting fallback error frame");
             Metrics::inc(&metrics.produce_resp_err_total);
-            let err_resp = ProduceResp::Err(DeliveryErr {
-                code: u16::MAX,
+            // retryable=true：配合 librdkafka enable.idempotence 安全去重
+            let err_resp = ErrorResp {
+                kind: ErrorKind::Internal,
+                retryable: true,
+                native_code: 0,
                 message: format!("server panic: {msg}"),
-                retryable: true, // 可重试 + 配合 idempotence 安全去重
+            };
+            let _ = write_error_frame(stream, cid, err_resp).await;
+            Err(anyhow::anyhow!("panic in handle_produce_req: {msg}"))
+        }
+    }
+}
+
+/// PRODUCE_FNF：fire-and-forget，但**分层**回错——cluster 不存在 / 参数非法 /
+/// 本地 enqueue 失败等「同步可知」的前置错误回结构化 [`ErrorResp`] 给业务；
+/// enqueue 成功则回轻量 ack（不等 broker delivery，故 partition/offset = -1）。
+/// 真正的 broker 异步投递结果仍不保证。
+async fn handle_produce_fnf(
+    stream: &mut UnixStream,
+    cid: u64,
+    payload: &[u8],
+    producer: &ProducerHandle,
+    shutdown: &ShutdownHandle,
+    metrics: &Arc<Metrics>,
+) -> anyhow::Result<()> {
+    Metrics::inc(&metrics.produce_fnf_total);
+    if shutdown.is_draining() {
+        Metrics::inc(&metrics.frames_dropped_draining_total);
+        Metrics::inc(&metrics.produce_fnf_failed_total);
+        return write_error_frame(
+            stream,
+            cid,
+            ErrorResp::new(ErrorKind::WorkerDraining, "worker is draining"),
+        )
+        .await;
+    }
+    let msg = match ProduceFnf::decode(payload) {
+        Ok(m) => m,
+        Err(e) => {
+            Metrics::inc(&metrics.produce_fnf_failed_total);
+            warn!(cid, error = ?e, "PRODUCE_FNF payload decode failed");
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
+        }
+    };
+    let cluster = msg.cluster.clone();
+    let topic = msg.topic.clone();
+    match producer.produce_fnf(msg).await {
+        Ok(()) => {
+            let resp = ProduceResp::Ok(DeliveryAck {
+                partition: -1,
+                offset: -1,
             });
             let mut buf = BytesMut::new();
-            if err_resp.encode(&mut buf).is_ok() {
-                let _ = write_frame(stream, FrameType::ProduceResp, cid, &buf).await;
-            }
-            Err(anyhow::anyhow!("panic in handle_produce_req: {msg}"))
+            resp.encode(&mut buf).context("encode fnf ack")?;
+            write_frame(stream, FrameType::ProduceResp, cid, &buf).await
+        }
+        Err(e) => {
+            Metrics::inc(&metrics.produce_fnf_failed_total);
+            warn!(cid, %cluster, %topic, error = ?e, "PRODUCE_FNF enqueue failed");
+            write_error_frame(stream, cid, WorkerError::from_anyhow(&e)).await
         }
     }
 }
@@ -823,42 +913,48 @@ async fn handle_produce_req_inner(
     cid: u64,
     payload: &[u8],
     producer: &ProducerHandle,
+    shutdown: &ShutdownHandle,
     metrics: &Arc<Metrics>,
 ) -> anyhow::Result<()> {
-    let resp = match ProduceReq::decode(payload) {
-        Ok(msg) => {
-            debug!(cid, cluster = %msg.cluster, topic = %msg.topic, "PRODUCE_REQ received");
-            match producer.produce_ack(msg).await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(cid, error = ?e, "produce_ack internal error");
-                    ProduceResp::Err(DeliveryErr {
-                        code: u16::MAX,
-                        message: format!("worker: {e}"),
-                        retryable: false,
-                    })
-                }
-            }
-        }
+    Metrics::inc(&metrics.produce_req_total);
+    if shutdown.is_draining() {
+        Metrics::inc(&metrics.frames_dropped_draining_total);
+        Metrics::inc(&metrics.produce_resp_err_total);
+        return write_error_frame(
+            stream,
+            cid,
+            ErrorResp::new(ErrorKind::WorkerDraining, "worker is draining"),
+        )
+        .await;
+    }
+    let msg = match ProduceReq::decode(payload) {
+        Ok(m) => m,
         Err(e) => {
             warn!(cid, error = ?e, "PRODUCE_REQ payload decode failed");
-            ProduceResp::Err(DeliveryErr {
-                code: u16::MAX,
-                message: format!("payload decode: {e}"),
-                retryable: false,
-            })
+            Metrics::inc(&metrics.produce_resp_err_total);
+            return write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+            )
+            .await;
         }
     };
-
-    match &resp {
-        ProduceResp::Ok(_) => Metrics::inc(&metrics.produce_resp_ok_total),
-        ProduceResp::Err(_) => Metrics::inc(&metrics.produce_resp_err_total),
+    debug!(cid, cluster = %msg.cluster, topic = %msg.topic, "PRODUCE_REQ received");
+    match producer.produce_ack(msg).await {
+        Ok(resp) => {
+            Metrics::inc(&metrics.produce_resp_ok_total);
+            let mut resp_payload = BytesMut::new();
+            resp.encode(&mut resp_payload)
+                .context("encode PRODUCE_RESP")?;
+            write_frame(stream, FrameType::ProduceResp, cid, &resp_payload).await
+        }
+        Err(e) => {
+            warn!(cid, error = ?e, "produce_ack failed");
+            Metrics::inc(&metrics.produce_resp_err_total);
+            write_error_frame(stream, cid, WorkerError::from_anyhow(&e)).await
+        }
     }
-
-    let mut resp_payload = BytesMut::new();
-    resp.encode(&mut resp_payload)
-        .context("encode PRODUCE_RESP")?;
-    write_frame(stream, FrameType::ProduceResp, cid, &resp_payload).await
 }
 
 async fn write_frame(
@@ -872,4 +968,30 @@ async fn write_frame(
     stream.write_all(&buf).await.context("write frame")?;
     stream.flush().await.context("flush frame")?;
     Ok(())
+}
+
+/// 把一个 [`ErrorResp`] 编成 `FrameType::Error` 帧写回客户端——
+/// 所有 handler 的失败统一走这里，让 PHP 侧拿到结构化 kind。
+async fn write_error_frame(
+    stream: &mut UnixStream,
+    cid: u64,
+    err: ErrorResp,
+) -> anyhow::Result<()> {
+    let mut buf = BytesMut::new();
+    err.encode(&mut buf).context("encode error resp")?;
+    write_frame(stream, FrameType::Error, cid, &buf).await
+}
+
+/// 把 [`ConsumerError`] 映射成结构化 [`ErrorResp`]。
+/// 关键：`NotFound → SUBSCRIPTION_NOT_FOUND`，让扩展端自愈从字符串匹配升级为 kind 判定。
+fn consumer_err_to_resp(e: &ConsumerError) -> ErrorResp {
+    match e {
+        ConsumerError::NotFound(_) => {
+            ErrorResp::new(ErrorKind::SubscriptionNotFound, e.to_string())
+        }
+        ConsumerError::UnknownCluster(_) => {
+            ErrorResp::new(ErrorKind::ClusterNotRegistered, e.to_string())
+        }
+        ConsumerError::Backend(err) => WorkerError::from_anyhow(err),
+    }
 }
