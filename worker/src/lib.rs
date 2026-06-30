@@ -9,6 +9,7 @@
 
 pub mod cluster;
 pub mod consumer;
+pub mod error;
 pub mod metrics;
 pub mod producer;
 pub mod server;
@@ -16,6 +17,7 @@ pub mod shutdown;
 
 pub use cluster::{ClusterConfig, ClusterRegistry, ClusterRegistryHandle};
 pub use consumer::{Consumer, ConsumerError, ConsumerHandle, LoggingConsumer, SubscriptionId};
+pub use error::WorkerError;
 pub use metrics::Metrics;
 pub use producer::{LoggingProducer, Producer, ProducerHandle};
 pub use server::Server;

@@ -2,9 +2,10 @@
 
 use crate::cluster::{ClusterRegistryHandle, OAuthTokenSlot};
 use crate::consumer::GroupMetadataHandle;
+use crate::error::WorkerError;
 use crate::producer::Producer;
 use anyhow::Context;
-use hi_kafka_proto::{DeliveryAck, DeliveryErr, OffsetCommit, ProduceFnf, ProduceResp};
+use hi_kafka_proto::{DeliveryAck, ErrorKind, OffsetCommit, ProduceFnf, ProduceResp};
 use rdkafka::client::{ClientContext, OAuthToken};
 use rdkafka::consumer::ConsumerGroupMetadata;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
@@ -148,13 +149,15 @@ impl KafkaProducer {
 
     /// 真正构建 ClusterEntry —— 由 OnceCell 串行化调用，同集群内只跑一次。
     async fn build_entry(&self, cluster: &str) -> anyhow::Result<Arc<ClusterEntry>> {
-        let (cluster_cfg, config_version) = self
-            .registry
-            .get_with_version(cluster)
-            .await
-            .with_context(|| {
-                format!("cluster '{cluster}' not registered (call registerCluster first)")
-            })?;
+        let (cluster_cfg, config_version) = match self.registry.get_with_version(cluster).await {
+            Some(v) => v,
+            None => {
+                return Err(anyhow::Error::new(WorkerError::new(
+                    ErrorKind::ClusterNotRegistered,
+                    format!("cluster '{cluster}' not registered (call registerCluster first)"),
+                )))
+            }
+        };
 
         let transactional = cluster_cfg.contains_key("transactional.id");
 
@@ -241,7 +244,7 @@ impl Producer for KafkaProducer {
             }
             Err((err, _msg)) => {
                 warn!(cluster = %msg.cluster, topic = %msg.topic, error = ?err, "PRODUCE_FNF delivery failed");
-                Err(anyhow::anyhow!("rdkafka send: {err}"))
+                Err(anyhow::Error::new(kafka_error_to_worker(&err)))
             }
         }
     }
@@ -413,21 +416,42 @@ impl Producer for KafkaProducer {
                     error = ?err,
                     "PRODUCE_REQ delivery failed"
                 );
-                Ok(ProduceResp::Err(kafka_error_to_resp(&err)))
+                Err(anyhow::Error::new(kafka_error_to_worker(&err)))
             }
         }
     }
 }
 
-fn kafka_error_to_resp(err: &KafkaError) -> DeliveryErr {
-    let (code, retryable) = match err {
-        KafkaError::MessageProduction(rd_err) => (rd_err_code_to_u16(rd_err), is_retryable(rd_err)),
-        _ => (u16::MAX, false),
+/// 把 broker 投递的 `KafkaError` 映射成业务友好的 [`ErrorKind`]。
+fn kafka_error_to_kind(err: &KafkaError) -> ErrorKind {
+    use RDKafkaErrorCode::*;
+    let code = match err {
+        KafkaError::MessageProduction(c) => *c,
+        _ => return ErrorKind::Internal,
     };
-    DeliveryErr {
-        code,
-        message: err.to_string(),
+    match code {
+        SaslAuthenticationFailed
+        | TopicAuthorizationFailed
+        | GroupAuthorizationFailed
+        | ClusterAuthorizationFailed => ErrorKind::AuthnAuthz,
+        MessageSizeTooLarge => ErrorKind::MessageTooLarge,
+        UnknownTopicOrPartition => ErrorKind::UnknownTopicOrPartition,
+        c if is_retryable(&c) => ErrorKind::BrokerRetryable,
+        _ => ErrorKind::Internal,
+    }
+}
+
+/// 把 broker 投递的 `KafkaError` 转成携带 kind 的 [`WorkerError`]（producer 路径用）。
+fn kafka_error_to_worker(err: &KafkaError) -> WorkerError {
+    let (native_code, retryable) = match err {
+        KafkaError::MessageProduction(c) => (*c as i32, is_retryable(c)),
+        _ => (0, false),
+    };
+    WorkerError {
+        kind: kafka_error_to_kind(err),
         retryable,
+        native_code,
+        message: err.to_string(),
     }
 }
 
@@ -445,17 +469,6 @@ fn build_headers(headers: &[hi_kafka_proto::MessageHeader]) -> Option<OwnedHeade
         });
     }
     Some(owned)
-}
-
-fn rd_err_code_to_u16(code: &RDKafkaErrorCode) -> u16 {
-    // RDKafkaErrorCode 是 #[repr(i32)] 的枚举，对应 librdkafka rd_kafka_resp_err_t。
-    // 大多数 broker 侧错误码是正数；负数（client-side）截断为 u16::MAX。
-    let raw: i32 = *code as i32;
-    if (0..=u16::MAX as i32).contains(&raw) {
-        raw as u16
-    } else {
-        u16::MAX
-    }
 }
 
 fn is_retryable(code: &RDKafkaErrorCode) -> bool {

@@ -24,7 +24,7 @@ use rdkafka::message::Headers as _;
 use rdkafka::topic_partition_list::TopicPartitionList;
 use rdkafka::Offset;
 use rdkafka::{ClientConfig, Message};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -218,6 +218,9 @@ struct SubscriptionState {
     rebalance_events: RebalanceQueue,
     /// 当前是否被 worker 自动 pause 了 fetcher（用户显式 pause 不进入此状态机）
     paused: AtomicBool,
+    /// 业务通过 `pause()` 显式暂停的分区集合。auto-resume 必须排除这些分区——
+    /// librdkafka 的 pause/resume 无引用计数，否则自动背压恢复会覆盖业务的暂停意图。
+    user_paused: StdMutex<HashSet<(String, i32)>>,
     /// 自动 pause 累计触发次数
     pause_total: AtomicU64,
     /// 自动 resume 累计触发次数
@@ -376,6 +379,7 @@ impl Consumer for KafkaConsumer {
                 consumer,
                 rebalance_events,
                 paused: AtomicBool::new(false),
+                user_paused: StdMutex::new(HashSet::new()),
                 pause_total: AtomicU64::new(0),
                 resume_total: AtomicU64::new(0),
                 terminated: AtomicBool::new(false),
@@ -450,11 +454,23 @@ impl Consumer for KafkaConsumer {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone()
                     .unwrap_or_else(|| "stream terminated".to_string());
-                return Err(ConsumerError::Backend(anyhow::anyhow!(
-                    "subscription {:?} terminated: {}",
-                    sub,
-                    last
-                )));
+                warn!(?sub, reason = %last, "subscription terminated; removing for self-heal");
+                // 释放本函数持有的 Arc，让下面 remove 出来的成为最后一个 strong 引用。
+                drop(state);
+                // 主动摘除已死订阅：
+                //   1) 不再把死 SubscriptionState 留在 DashMap 里泄漏 librdkafka 客户端 /
+                //      consumer group 成员资格；
+                //   2) 返回 NotFound（而非 Backend）——server.rs 会把它格式化成含 "not found"
+                //      的消息，命中扩展端 virtual_id 自愈通路触发重订阅（在全新 stream 上重建），
+                //      与"整个 worker 进程死亡"的恢复路径语义统一。
+                // StreamConsumer 的 Drop 是同步阻塞（rd_kafka_consumer_close），移到 blocking
+                // pool（与 unsubscribe 同款处理）。并发 poll 时只有第一个拿到 Some，其余拿 None
+                // 直接返回 NotFound（幂等）。
+                if let Some((_, dead)) = self.subscriptions.remove(&sub) {
+                    dead.task.abort();
+                    let _ = tokio::task::spawn_blocking(move || drop(dead)).await;
+                }
+                return Err(ConsumerError::NotFound(sub));
             }
             if timeout_ms == 0 {
                 return Ok(vec![]);
@@ -694,6 +710,7 @@ async fn flow_control(
         .ok_or(ConsumerError::NotFound(sub))?
         .clone();
     let consumer = state.consumer.clone();
+    let state_for_task = state.clone();
     tokio::task::spawn_blocking(move || {
         // 1. 构造 TPL：空 partitions → 取当前 assignment
         let mut tpl = TopicPartitionList::new();
@@ -707,10 +724,33 @@ async fn flow_control(
                 tpl.add_partition(&topic, partition);
             }
         }
+        // 展开后的目标分区，用于维护 user_paused 集合（供 auto-resume 排除）
+        let affected: Vec<(String, i32)> = tpl
+            .elements()
+            .into_iter()
+            .map(|el| (el.topic().to_string(), el.partition()))
+            .collect();
         // 2. 调底层 pause / resume
         match op {
             FlowOp::Pause => consumer.pause(&tpl).context("pause partitions")?,
             FlowOp::Resume => consumer.resume(&tpl).context("resume partitions")?,
+        }
+        // 3. 记录 / 清除业务显式 pause 的分区
+        let mut up = state_for_task
+            .user_paused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match op {
+            FlowOp::Pause => {
+                for tp in affected {
+                    up.insert(tp);
+                }
+            }
+            FlowOp::Resume => {
+                for tp in &affected {
+                    up.remove(tp);
+                }
+            }
         }
         Ok::<_, anyhow::Error>(())
     })
@@ -836,6 +876,7 @@ fn maybe_resume(
         Metrics::inc(&m.consumer_resume_total);
     }
     let consumer = state.consumer.clone();
+    let state_for_task = state.clone();
     tokio::task::spawn_blocking(move || {
         let assignment = match consumer.assignment() {
             Ok(a) => a,
@@ -844,7 +885,24 @@ fn maybe_resume(
                 return;
             }
         };
-        if let Err(e) = consumer.resume(&assignment) {
+        // 排除业务显式 pause 的分区——auto-resume 只恢复"因背压被自动 pause"的部分，
+        // 不能覆盖业务通过 pause() 表达的暂停意图。
+        let up = state_for_task
+            .user_paused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut tpl = TopicPartitionList::new();
+        for el in assignment.elements() {
+            if !up.contains(&(el.topic().to_string(), el.partition())) {
+                tpl.add_partition(el.topic(), el.partition());
+            }
+        }
+        drop(up);
+        if tpl.count() == 0 {
+            info!(?sub, "auto-resume: 当前 assignment 全部被业务显式 pause，跳过");
+            return;
+        }
+        if let Err(e) = consumer.resume(&tpl) {
             warn!(?sub, error = ?e, "auto-resume: consumer.resume failed");
         } else {
             info!(?sub, buf_len, buf_bytes, "auto-resume: 恢复 fetcher");
