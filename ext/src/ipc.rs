@@ -10,7 +10,8 @@ use crate::spawn;
 use crate::worker_health::{self, EnsureOutcome};
 use bytes::BytesMut;
 use hi_kafka_proto::{
-    codec, encode_frame, CommitReq, CommitResp, ConsumerMessage, FrameType, OffsetCommit,
+    codec, encode_frame, CommitReq, CommitResp, ConsumerMessage, ErrorKind, ErrorResp, FrameType,
+    OffsetCommit,
     OffsetSpec, PartitionSpec, PauseResumeOp, PauseResumeReq, PauseResumeResp, PollRebalanceReq,
     PollRebalanceResp, PollReq, PollResp, ProduceFnf, ProduceResp, RebalanceEvent,
     RegisterClusterReq, RegisterClusterResp, SeekReq, SeekResp, SendOffsetsReq, SendOffsetsResp,
@@ -74,6 +75,15 @@ pub enum IpcError {
 
     #[error("server error: {0}")]
     Server(String),
+
+    /// worker 回的结构化错误（Error 帧）：携带机器可读 kind / retryable / 原生码。
+    #[error("[{}] {message}", .kind.as_str())]
+    Worker {
+        kind: ErrorKind,
+        retryable: bool,
+        native_code: i32,
+        message: String,
+    },
 }
 
 impl From<std::io::Error> for IpcError {
@@ -148,6 +158,7 @@ fn should_invalidate(e: &IpcError) -> bool {
         IpcError::Encode(_) | IpcError::DecodeResp(_) => false,
         IpcError::UnexpectedKind(_) | IpcError::CidMismatch { .. } => false,
         IpcError::Server(_) => false, // 业务层错误，worker 还活着
+        IpcError::Worker { .. } => false, // worker 回的结构化业务错误，worker 还活着
     }
 }
 
@@ -273,15 +284,19 @@ fn produce_fnf_inner(
 ) -> Result<(), IpcError> {
     ensure(socket)?;
     let payload = encode_produce_payload(cluster, topic, key, value, opts)?;
+    let cid = next_cid();
     let pool = pool::pool_for(Path::new(socket));
     let mut conn = pool.acquire()?;
-    write_frame(
-        &mut conn,
-        FrameType::ProduceFnf,
-        0,
-        &payload,
-        Some(Duration::from_secs(1)),
-    )
+    let timeout = Duration::from_secs(5);
+    write_frame(&mut conn, FrameType::ProduceFnf, cid, &payload, Some(timeout))?;
+    // FNF 分层：等 worker 本地 enqueue ack（不等 broker delivery）。同步可知的前置错误
+    // （cluster 未注册 / 队列满 / 参数非法）会以 Error 帧经 recv_resp 变成 IpcError::Worker。
+    let (kind, _payload) = recv_resp(&mut conn, cid, timeout)?;
+    if kind != FrameType::ProduceResp {
+        conn.poison();
+        return Err(IpcError::UnexpectedKind(kind));
+    }
+    Ok(())
 }
 
 pub fn produce_sync(
@@ -322,15 +337,17 @@ fn produce_fnf_bin_inner(
 ) -> Result<(), IpcError> {
     ensure(socket)?;
     let payload = encode_produce_payload_bin(cluster, topic, key, value, opts)?;
+    let cid = next_cid();
     let pool = pool::pool_for(Path::new(socket));
     let mut conn = pool.acquire()?;
-    write_frame(
-        &mut conn,
-        FrameType::ProduceFnf,
-        0,
-        &payload,
-        Some(Duration::from_secs(1)),
-    )
+    let timeout = Duration::from_secs(5);
+    write_frame(&mut conn, FrameType::ProduceFnf, cid, &payload, Some(timeout))?;
+    let (kind, _payload) = recv_resp(&mut conn, cid, timeout)?;
+    if kind != FrameType::ProduceResp {
+        conn.poison();
+        return Err(IpcError::UnexpectedKind(kind));
+    }
+    Ok(())
 }
 
 pub fn produce_sync_bin(
@@ -370,37 +387,10 @@ fn produce_sync_bin_inner(
         Some(timeout),
     )?;
 
-    let stream = conn.stream_mut();
-    stream.set_read_timeout(Some(timeout))?;
-
-    let mut header = [0u8; HEADER_LEN];
-    if let Err(e) = stream.read_exact(&mut header) {
+    let (kind, resp_payload) = recv_resp(&mut conn, cid, timeout)?;
+    if kind != FrameType::ProduceResp {
         conn.poison();
-        return Err(e.into());
-    }
-    let h = match codec::decode_header(&header) {
-        Ok(h) => h,
-        Err(e) => {
-            conn.poison();
-            return Err(IpcError::DecodeResp(e.to_string()));
-        }
-    };
-    if h.kind != FrameType::ProduceResp {
-        conn.poison();
-        return Err(IpcError::UnexpectedKind(h.kind));
-    }
-    if h.cid != cid {
-        conn.poison();
-        return Err(IpcError::CidMismatch {
-            sent: cid,
-            got: h.cid,
-        });
-    }
-
-    let mut resp_payload = vec![0u8; h.payload_len as usize];
-    if let Err(e) = conn.stream_mut().read_exact(&mut resp_payload) {
-        conn.poison();
-        return Err(e.into());
+        return Err(IpcError::UnexpectedKind(kind));
     }
     ProduceResp::decode(&resp_payload).map_err(|e| IpcError::DecodeResp(e.to_string()))
 }
@@ -428,37 +418,10 @@ fn produce_sync_inner(
         Some(timeout),
     )?;
 
-    let stream = conn.stream_mut();
-    stream.set_read_timeout(Some(timeout))?;
-
-    let mut header = [0u8; HEADER_LEN];
-    if let Err(e) = stream.read_exact(&mut header) {
+    let (kind, resp_payload) = recv_resp(&mut conn, cid, timeout)?;
+    if kind != FrameType::ProduceResp {
         conn.poison();
-        return Err(e.into());
-    }
-    let h = match codec::decode_header(&header) {
-        Ok(h) => h,
-        Err(e) => {
-            conn.poison();
-            return Err(IpcError::DecodeResp(e.to_string()));
-        }
-    };
-    if h.kind != FrameType::ProduceResp {
-        conn.poison();
-        return Err(IpcError::UnexpectedKind(h.kind));
-    }
-    if h.cid != cid {
-        conn.poison();
-        return Err(IpcError::CidMismatch {
-            sent: cid,
-            got: h.cid,
-        });
-    }
-
-    let mut resp_payload = vec![0u8; h.payload_len as usize];
-    if let Err(e) = conn.stream_mut().read_exact(&mut resp_payload) {
-        conn.poison();
-        return Err(e.into());
+        return Err(IpcError::UnexpectedKind(kind));
     }
     ProduceResp::decode(&resp_payload).map_err(|e| IpcError::DecodeResp(e.to_string()))
 }
@@ -486,20 +449,15 @@ fn round_trip(
 }
 
 /// round_trip 的单次执行体。retry-friendly：失败不副作用，全部清理由 PooledConn::Drop 处理。
-fn round_trip_once(
-    socket: &str,
-    req_kind: FrameType,
-    expected_resp_kind: FrameType,
-    req_payload: &[u8],
+/// 读一帧响应：13B header（校验 cid）+ payload。
+/// 若是 worker 回的 `Error` 帧 → 解码成结构化 [`IpcError::Worker`]（不 poison 连接，
+/// 连接健康，只是业务/前置错）。否则返回 `(frame_kind, payload)` 供调用方按
+/// expected kind 处理。IO / 解码错会 poison 连接，让池下次重建。
+fn recv_resp(
+    conn: &mut pool::PooledConn,
+    cid: u64,
     timeout: Duration,
-) -> Result<Vec<u8>, IpcError> {
-    ensure(socket)?;
-    let cid = next_cid();
-    let pool = pool::pool_for(Path::new(socket));
-    let mut conn = pool.acquire()?;
-
-    write_frame(&mut conn, req_kind, cid, req_payload, Some(timeout))?;
-
+) -> Result<(FrameType, Vec<u8>), IpcError> {
     let stream = conn.stream_mut();
     stream.set_read_timeout(Some(timeout))?;
 
@@ -515,10 +473,6 @@ fn round_trip_once(
             return Err(IpcError::DecodeResp(e.to_string()));
         }
     };
-    if h.kind != expected_resp_kind {
-        conn.poison();
-        return Err(IpcError::UnexpectedKind(h.kind));
-    }
     if h.cid != cid {
         conn.poison();
         return Err(IpcError::CidMismatch {
@@ -526,11 +480,41 @@ fn round_trip_once(
             got: h.cid,
         });
     }
-
     let mut payload = vec![0u8; h.payload_len as usize];
     if let Err(e) = conn.stream_mut().read_exact(&mut payload) {
         conn.poison();
         return Err(e.into());
+    }
+    if h.kind == FrameType::Error {
+        let er = ErrorResp::decode(&payload).map_err(|e| IpcError::DecodeResp(e.to_string()))?;
+        return Err(IpcError::Worker {
+            kind: er.kind,
+            retryable: er.retryable,
+            native_code: er.native_code,
+            message: er.message,
+        });
+    }
+    Ok((h.kind, payload))
+}
+
+fn round_trip_once(
+    socket: &str,
+    req_kind: FrameType,
+    expected_resp_kind: FrameType,
+    req_payload: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, IpcError> {
+    ensure(socket)?;
+    let cid = next_cid();
+    let pool = pool::pool_for(Path::new(socket));
+    let mut conn = pool.acquire()?;
+
+    write_frame(&mut conn, req_kind, cid, req_payload, Some(timeout))?;
+
+    let (kind, payload) = recv_resp(&mut conn, cid, timeout)?;
+    if kind != expected_resp_kind {
+        conn.poison();
+        return Err(IpcError::UnexpectedKind(kind));
     }
     Ok(payload)
 }

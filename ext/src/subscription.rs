@@ -5,7 +5,7 @@
 //! - PHP 业务拿到的 `subscription_id` 是 **virtual_id**，全进程单调
 //! - 注册表保存 `virtual_id → (订阅参数 + 当前 real_id)`
 //! - 当 worker 上的 real subscription 因 worker 崩溃而消失时，扩展透明：
-//!   1. 检测 `IpcError::Server` 含 "not found" 字样
+//!   1. 检测 `IpcError::Worker{kind=SubscriptionNotFound}`（结构化，非字符串匹配）
 //!   2. 用注册表里保存的参数调 `ipc::subscribe()` 重订阅
 //!   3. 更新 real_id，重试一次原操作
 //! - 业务 `$sub` 句柄永远不变；offset 推进语义遵循 Kafka at-least-once：
@@ -15,7 +15,7 @@
 //! （新订阅尚未 poll 出任何位置），符合 Kafka 行为预期。
 
 use crate::ipc::{self, IpcError};
-use hi_kafka_proto::ConsumerMessage;
+use hi_kafka_proto::{ConsumerMessage, ErrorKind};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,11 +65,18 @@ pub fn resubscribe_stats() -> ResubscribeStats {
 }
 
 /// 检查错误是否暗示 "real subscription 在 worker 上不存在了"。
+///
+/// 结构化判定（替代脆弱的 `"not found"` 字符串匹配）：worker 现在对 subscription
+/// 不存在统一回 `Error` 帧 `kind=SubscriptionNotFound`，扩展端经 `recv_resp` 解成
+/// `IpcError::Worker`。措辞变化不再影响自愈。
 fn is_subscription_gone(e: &IpcError) -> bool {
-    match e {
-        IpcError::Server(msg) => msg.contains("not found"),
-        _ => false,
-    }
+    matches!(
+        e,
+        IpcError::Worker {
+            kind: ErrorKind::SubscriptionNotFound,
+            ..
+        }
+    )
 }
 
 pub fn subscribe(
