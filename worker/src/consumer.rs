@@ -7,6 +7,7 @@ use hi_kafka_proto::{ConsumerMessage, OffsetSpec, PartitionSpec, RebalanceEvent,
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
@@ -127,6 +128,18 @@ pub trait Consumer: Send + Sync {
         Err(ConsumerError::Backend(anyhow::anyhow!(
             "group_metadata not supported by this consumer backend"
         )))
+    }
+
+    /// 最近 `within` 内有过活动（poll）的订阅数。worker idle 自退判定用。
+    ///
+    /// **为何带时间窗**：只统计「近期还在 poll」的订阅来阻止自退。否则
+    /// owner 进程已死、却没 `unsubscribe` 的泄漏订阅（其 stream_loop 仍在后台
+    /// 长跑、持 group 成员资格）会让计数恒 >0，worker 永远 idle 不掉、孤儿
+    /// 残留。窗口由 server 传入（取 `idle_timeout`）：活跃 consumer 持续 poll →
+    /// 始终在窗口内 → 受保护；泄漏订阅 `within` 内无 poll → 不再计数 → 放行自退。
+    /// 默认 0（LoggingConsumer 等无真实订阅的后端）。
+    fn active_subscriptions(&self, _within: Duration) -> usize {
+        0
     }
 }
 

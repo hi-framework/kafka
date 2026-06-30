@@ -73,6 +73,10 @@ pub enum FrameType {
     Error = 0x40,
     /// worker 即将停机通知
     ShutdownNotice = 0x41,
+    /// 客户端告别（PHP 进程退出时主动发）：fire-and-forget，无 payload。
+    /// worker 收到后若此连接关闭即成最后一个连接且无活跃订阅，则立即自退，
+    /// 不必等 idle 超时。发送失败 / worker 已死 → 退化回 idle 自退。
+    Goodbye = 0x42,
 }
 
 impl FrameType {
@@ -108,6 +112,7 @@ impl FrameType {
             0x30 => Self::FlowControl,
             0x40 => Self::Error,
             0x41 => Self::ShutdownNotice,
+            0x42 => Self::Goodbye,
             _ => return None,
         })
     }

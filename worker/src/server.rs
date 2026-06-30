@@ -18,6 +18,7 @@ use hi_kafka_proto::{
 };
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -93,6 +94,10 @@ impl Server {
         let mut tasks: JoinSet<()> = JoinSet::new();
         let idle_timeout = self.idle_timeout;
         let mut last_active = tokio::time::Instant::now();
+        // 收到某客户端的 Goodbye（PHP 进程退出主动告别）后置位。配合「最后一个连接
+        // 关闭」判定，让 worker 在最后使用者离开时立即自退，而不必等满 idle_timeout。
+        // 仅在启用了 idle 自退（idle_timeout > 0，即内嵌 worker）时生效。
+        let expedited = Arc::new(AtomicBool::new(false));
         // idle 检查间隔：idle_timeout 的 1/4，夹在 [1s, 30s]。禁用时给个无害的 30s。
         let check_interval = if idle_timeout.is_zero() {
             Duration::from_secs(30)
@@ -124,8 +129,9 @@ impl Server {
                             let registry = self.registry.clone();
                             let shutdown = self.shutdown.clone();
                             let metrics = self.metrics.clone();
+                            let expedited = expedited.clone();
                             tasks.spawn(async move {
-                                if let Err(e) = handle_connection(stream, producer, consumer, registry, shutdown, metrics).await {
+                                if let Err(e) = handle_connection(stream, producer, consumer, registry, shutdown, metrics, expedited).await {
                                     warn!(error = ?e, "connection ended with error");
                                 }
                             });
@@ -137,18 +143,46 @@ impl Server {
                         }
                     }
                 }
+                // 主动退出快路径：某连接 task 结束时立即判定。客户端 Goodbye 后紧接着
+                // 关连接 → 这里精确捕捉「最后一个连接关闭」的瞬间，无需等 idle tick。
+                // 条件：启用 idle 自退 + 收到过 Goodbye + 已无任何连接 + 无活跃订阅。
+                Some(joined) = tasks.join_next(), if !tasks.is_empty() && !idle_timeout.is_zero() => {
+                    if let Err(e) = joined {
+                        warn!(error = ?e, "connection task ended with error");
+                    }
+                    reap_finished(&mut tasks);
+                    if expedited.load(Ordering::Acquire)
+                        && tasks.is_empty()
+                        && self.consumer.active_subscriptions(idle_timeout) == 0
+                    {
+                        info!("client goodbye + last connection closed, self-terminating");
+                        self.shutdown.start_draining();
+                    }
+                }
                 _ = idle_ticker.tick(), if !idle_timeout.is_zero() => {
                     // 清掉已结束的 connection task，才能准确判断"无连接"。
                     reap_finished(&mut tasks);
                     if tasks.is_empty() {
-                        // 没有任何活跃 / idle 连接（客户端连接池里的连接对应一个阻塞在
-                        // read 的 task；全部断开才会走到这里）。持续空闲超时则自退。
-                        if last_active.elapsed() >= idle_timeout {
-                            info!(?idle_timeout, "worker idle (no connections), self-terminating");
+                        // 无连接。是否还有「近期活跃」订阅（idle_timeout 内 poll 过）？
+                        // 后者保护后台 consumer：仍在 poll 的订阅持有 offset 进度 / group
+                        // 成员资格，不能被 idle 退误杀（否则触发不必要的 rebalance 抖动）。
+                        // 只看「近期活跃」——owner 已死、没 unsubscribe 的泄漏订阅在
+                        // idle_timeout 内无 poll 即不再计数，放行自退（修复孤儿残留）。
+                        //
+                        // 关键：有活跃订阅时**不刷新 last_active**，让订阅 staleness 与连接侧
+                        // last_active 共用同一个 idle_timeout 到期点。否则订阅转 stale 后
+                        // last_active 还停在「刚才」，要再等一个完整 idle_timeout 才退（双倍）。
+                        let has_active_subs =
+                            self.consumer.active_subscriptions(idle_timeout) > 0;
+                        if !has_active_subs && last_active.elapsed() >= idle_timeout {
+                            info!(
+                                ?idle_timeout,
+                                "worker idle (no connections, no active subscriptions), self-terminating"
+                            );
                             self.shutdown.start_draining();
                         }
                     } else {
-                        // 还有 in-flight 连接 → 不算空闲，刷新计时基准。
+                        // 还有连接 → 不算空闲，刷新计时基准。
                         last_active = tokio::time::Instant::now();
                     }
                 }
@@ -230,6 +264,7 @@ async fn handle_connection(
     registry: ClusterRegistryHandle,
     shutdown: ShutdownHandle,
     metrics: Arc<Metrics>,
+    expedited: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut header_buf = [0u8; HEADER_LEN];
     let mut payload_buf = BytesMut::new();
@@ -312,6 +347,7 @@ async fn handle_connection(
             &registry,
             &shutdown,
             &metrics,
+            &expedited,
         )
         .await?;
     }
@@ -334,9 +370,10 @@ async fn dispatch(
     registry: &ClusterRegistryHandle,
     shutdown: &ShutdownHandle,
     metrics: &Arc<Metrics>,
+    expedited: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let result = AssertUnwindSafe(dispatch_inner(
-        stream, kind, cid, payload, producer, consumer, registry, shutdown, metrics,
+        stream, kind, cid, payload, producer, consumer, registry, shutdown, metrics, expedited,
     ))
     .catch_unwind()
     .await;
@@ -360,6 +397,7 @@ async fn dispatch_inner(
     registry: &ClusterRegistryHandle,
     shutdown: &ShutdownHandle,
     metrics: &Arc<Metrics>,
+    expedited: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     match kind {
         FrameType::Hello => {
@@ -409,6 +447,14 @@ async fn dispatch_inner(
         }
         FrameType::SetOAuthBearerTokenReq => {
             handle_set_oauth_token(stream, cid, payload, registry).await?;
+        }
+        FrameType::Goodbye => {
+            // 客户端（PHP 进程）主动告别，fire-and-forget，无响应。置位 expedited：
+            // 此连接关闭后若已无其它连接且无活跃订阅，主循环立即自退（见 run() 的
+            // join_next 分支）。worker 是节点级共享单例，这里**不**直接 drain——
+            // 必须等「最后一个连接关闭」的判定，避免误杀仍在使用的其它进程。
+            debug!(cid, "client goodbye received; marking expedited shutdown");
+            expedited.store(true, Ordering::Release);
         }
         other => {
             warn!(kind = ?other, cid, "frame type not yet implemented");

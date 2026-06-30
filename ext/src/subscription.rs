@@ -231,3 +231,33 @@ where
 pub fn registered_count() -> usize {
     registry().lock().unwrap().len()
 }
+
+/// 本进程注册表里所有 distinct socket 路径。进程退出（MSHUTDOWN）主动退出协调用。
+/// 锁中毒也尽力返回（into_inner）。
+pub fn known_sockets() -> Vec<String> {
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut set = std::collections::BTreeSet::new();
+    for e in reg.values() {
+        set.insert(e.socket.to_string_lossy().to_string());
+    }
+    set.into_iter().collect()
+}
+
+/// 取出并从注册表移除某 socket 上本进程的所有订阅，返回它们的 real subscription id。
+/// 进程退出（MSHUTDOWN）时调用：这些订阅不再需要，调用方逐个发 Unsubscribe 干净
+/// 离组，从而让 worker 的「活跃订阅」立即归零、可立即自退。锁中毒也尽力处理。
+pub fn drain_real_ids_for_socket(socket: &str) -> Vec<u64> {
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let matching: Vec<u64> = reg
+        .iter()
+        .filter(|(_, e)| e.socket.to_string_lossy() == socket)
+        .map(|(vid, _)| *vid)
+        .collect();
+    let mut real_ids = Vec::with_capacity(matching.len());
+    for vid in matching {
+        if let Some(e) = reg.remove(&vid) {
+            real_ids.push(e.real_id);
+        }
+    }
+    real_ids
+}

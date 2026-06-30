@@ -127,6 +127,14 @@ impl ConnectionPool {
         }
         // 超过 max_idle 直接丢弃
     }
+
+    /// 关闭（丢弃）所有空闲连接。进程退出（MSHUTDOWN）时调用：让本进程持有的
+    /// 空闲 UDS 连接立刻断开，worker 端对应阻塞 read task 随即结束，从而能尽快
+    /// 判定「最后一个连接关闭」并自退。被取走在用的连接不受影响。
+    /// 锁中毒也尽力清空（into_inner），保证进程退出路径健壮。
+    fn clear_idle(&self) {
+        self.idle.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
 }
 
 /// F: 同步 HELLO 握手。新建 UDS 连接后立即跑——任一步失败 → 调用方关连接。
@@ -242,6 +250,29 @@ pub fn all_stats() -> Vec<(PathBuf, PoolStats, usize, usize)> {
     map.iter()
         .map(|(path, pool)| (path.clone(), pool.stats(), pool.idle_count(), pool.max_idle))
         .collect()
+}
+
+/// 本进程已建过池的所有 socket 路径。进程退出（MSHUTDOWN）主动退出协调用。
+/// 锁中毒也尽力返回（into_inner）。
+pub fn socket_paths() -> Vec<PathBuf> {
+    pools()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// 关闭指定 socket 池里的所有空闲连接。不存在的 socket 直接返回。
+/// 见 [`ConnectionPool::clear_idle`]。
+pub fn close_idle(socket: &Path) {
+    let pool = {
+        let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(socket).cloned()
+    };
+    if let Some(pool) = pool {
+        pool.clear_idle();
+    }
 }
 
 #[cfg(test)]

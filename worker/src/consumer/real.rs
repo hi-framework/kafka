@@ -34,6 +34,15 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
+/// 进程内单调时钟（毫秒）。订阅活跃度时间戳用——只需相对比较、不需墙钟，
+/// 也不依赖 tokio 上下文。
+fn uptime_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// 单个 subscription 的 rebalance 事件队列。
 type RebalanceQueue = Arc<StdMutex<VecDeque<RebalanceEvent>>>;
 
@@ -239,6 +248,10 @@ struct SubscriptionState {
     buffer_bytes: AtomicUsize,
     /// 缓冲满（条数 OR 字节）时丢弃的消息累计数；接 Prometheus
     messages_dropped_total: AtomicU64,
+    /// 最近一次被 poll 的进程内时钟（毫秒，见 [`uptime_ms`]）。worker idle 自退
+    /// 判定按此过滤「近期活跃」订阅：owner 进程已死但没 unsubscribe 的泄漏订阅
+    /// 不会再 poll，时间窗一过就不再阻止自退（见 `active_subscriptions`）。
+    last_active_ms: AtomicU64,
     /// 后台拉流 task 的 handle。Drop 时 abort。
     task: JoinHandle<()>,
 }
@@ -299,6 +312,18 @@ impl KafkaConsumer {
 
 #[async_trait::async_trait]
 impl Consumer for KafkaConsumer {
+    fn active_subscriptions(&self, within: Duration) -> usize {
+        let now = uptime_ms();
+        let within_ms = within.as_millis() as u64;
+        self.subscriptions
+            .iter()
+            .filter(|entry| {
+                let last = entry.value().last_active_ms.load(Ordering::Relaxed);
+                now.saturating_sub(last) <= within_ms
+            })
+            .count()
+    }
+
     /// 注：每次 subscribe 都新建 StreamConsumer，**当场**拿当前 cluster 配置。
     /// 这意味着 `registerCluster` 覆盖后已建立的 subscription 还在用老配置，
     /// 不会自动切。PHP 端在 stream_loop terminated 后会经 virtual_id 自愈
@@ -386,6 +411,7 @@ impl Consumer for KafkaConsumer {
                 last_error: StdMutex::new(None),
                 buffer_bytes: AtomicUsize::new(0),
                 messages_dropped_total: AtomicU64::new(0),
+                last_active_ms: AtomicU64::new(uptime_ms()),
                 task,
                 metrics: metrics_clone,
             }
@@ -413,6 +439,9 @@ impl Consumer for KafkaConsumer {
             .get(&sub)
             .ok_or(ConsumerError::NotFound(sub))?
             .clone();
+        // 刷新活跃时间戳：标记该订阅「还有人在 poll」，使其在 idle 自退判定中
+        // 继续受保护（见 active_subscriptions / last_active_ms）。
+        state.last_active_ms.store(uptime_ms(), Ordering::Relaxed);
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms as u64);
         let resume_at = self.config.resume_at;
