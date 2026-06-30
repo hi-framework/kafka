@@ -23,5 +23,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# panic 用默认 unwind（不能设 abort）：worker `server.rs` 的 dispatch / produce_ack
+# 两层 `catch_unwind` 帧级 panic 隔离**只有在 unwind 下才生效**——abort 会让单帧
+# handler panic 直接杀掉整个内嵌 worker（连带所有集群 / 订阅 / 在途事务），与
+# “panic 时只关该连接让客户端透明重试”的设计意图相悖。ext-php-rs 的 `#[php_function]`
+# 同样依赖 unwind 把 Rust panic 转成 PHP 异常，而非崩掉 PHP 进程。
+panic = "unwind"
 strip = true

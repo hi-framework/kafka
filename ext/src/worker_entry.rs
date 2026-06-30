@@ -159,6 +159,13 @@ async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
     let mut sig_term = signal(SignalKind::terminate())?;
     let mut sig_int = signal(SignalKind::interrupt())?;
 
+    // 内嵌 worker：无连接持续空闲超时则自退，解决主进程退出后 worker 残留。
+    // 默认 5min；HI_KAFKA_IDLE_TIMEOUT_MS=0 可禁用（回到常驻）。
+    let idle_timeout = std::env::var("HI_KAFKA_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(300));
     let server = server::Server::bind_with(
         &config.socket,
         producer.clone(),
@@ -166,6 +173,7 @@ async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
         registry,
         shutdown.clone(),
         m,
+        idle_timeout,
     )
     .await?;
 

@@ -33,6 +33,11 @@ struct Cli {
     /// Prometheus 指标 HTTP 端点地址。空字符串则禁用。
     #[arg(long, env = "HI_KAFKA_METRICS_ADDR", default_value = "127.0.0.1:9876")]
     metrics_addr: String,
+
+    /// 无连接持续空闲多久后自动退出（毫秒）。0 = 禁用（常驻；standalone 默认，
+    /// 由 systemd / 运维管理生命周期）。内嵌进 .so 的 worker 默认 5min。
+    #[arg(long, env = "HI_KAFKA_IDLE_TIMEOUT_MS", default_value_t = 0)]
+    idle_timeout_ms: u64,
 }
 
 #[tokio::main]
@@ -86,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         registry,
         shutdown.clone(),
         m.clone(),
+        Duration::from_millis(cli.idle_timeout_ms),
     )
     .await
     .context("bind UDS")?;

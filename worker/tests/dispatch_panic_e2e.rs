@@ -81,9 +81,17 @@ async fn test_dispatch_panic_closes_connection_not_worker() {
     let shutdown = ShutdownState::new();
     let metrics = Metrics::new();
 
-    let server = Server::bind_with(&socket, producer, consumer, registry, shutdown, metrics)
-        .await
-        .unwrap();
+    let server = Server::bind_with(
+        &socket,
+        producer,
+        consumer,
+        registry,
+        shutdown,
+        metrics,
+        Duration::ZERO,
+    )
+    .await
+    .unwrap();
     let _handle = tokio::spawn(server.run(Duration::from_secs(5)));
 
     // 等 socket 就绪
