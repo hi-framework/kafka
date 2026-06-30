@@ -10,7 +10,7 @@
 //! - 失效后下次 ensure 重新走完整流程（可能拉起新 worker）
 
 use crate::spawn;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -18,6 +18,27 @@ static KNOWN_ALIVE: OnceLock<Mutex<HashMap<PathBuf, ()>>> = OnceLock::new();
 
 fn cache() -> &'static Mutex<HashMap<PathBuf, ()>> {
     KNOWN_ALIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 本进程「曾成功确保过」的所有 worker socket。与 `KNOWN_ALIVE` 不同：**永不因
+/// invalidate 清空**（worker 中途死亡 / 重启也保留），用于进程退出（MSHUTDOWN）时
+/// 对每个用过的 worker 发 Goodbye。覆盖 Swoole/Swow driver 这类**不走 Rust 连接池、
+/// 只调 `ensure_worker`** 的路径——否则 [`crate::lifecycle`] 的 `collect_sockets`
+/// 看不到它们的 socket，主动退出对协程 driver 失效。
+static EVER_ENSURED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+fn ever_ensured() -> &'static Mutex<BTreeSet<String>> {
+    EVER_ENSURED.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// 本进程曾确保过的所有 worker socket 快照。进程退出主动退出协调用（[`crate::lifecycle`]）。
+pub fn ever_ensured_sockets() -> Vec<String> {
+    ever_ensured()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
 }
 
 /// L: 调用结果——区分"缓存命中"和"刚 spawn"，让上层 ipc::ensure 在新 worker 出现时
@@ -44,6 +65,13 @@ pub fn ensure(socket: &str) -> Result<EnsureOutcome, spawn::SpawnError> {
     let cfg = spawn::SpawnConfig::from_env(key.clone());
     let outcome = spawn::ensure_worker(&cfg)?;
     cache().lock().unwrap().insert(key, ());
+    // 记下「曾确保过」的 socket（仅在成功后）。即便后续 invalidate，这里也保留，
+    // 供 MSHUTDOWN 主动退出对该 worker 发 Goodbye——尤其覆盖只调 ensure_worker、
+    // 不进 Rust 连接池的 Swoole/Swow driver。
+    ever_ensured()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(socket.to_string());
     Ok(match outcome {
         spawn::SpawnOutcome::AlreadyAlive => EnsureOutcome::AlreadyAlive,
         spawn::SpawnOutcome::JustSpawned => EnsureOutcome::JustSpawned,

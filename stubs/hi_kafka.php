@@ -499,6 +499,11 @@ namespace {
     function hi_kafka_commit(int $subscriptionId, ?int $timeoutMs = null): void {}
     function hi_kafka_unsubscribe(int $subscriptionId): void {}
 
+    /** @internal 协程 driver 登记订阅，供进程退出时主动 unsubscribe + Goodbye */
+    function hi_kafka_track_subscription(int $subscriptionId, ?string $socket = null): void {}
+    /** @internal 与 hi_kafka_track_subscription 配对，driver 主动 unsubscribe 后注销 */
+    function hi_kafka_untrack_subscription(int $subscriptionId, ?string $socket = null): void {}
+
     /**
      * 扩展端连接池统计（按 socket 路径分组）。
      *

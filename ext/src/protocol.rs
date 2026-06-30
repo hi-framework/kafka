@@ -284,6 +284,15 @@ pub fn build_commit_frame(subscription_id: u64) -> anyhow::Result<(u64, Vec<u8>)
     Ok((cid, frame.to_vec()))
 }
 
+/// Goodbye 是 fire-and-forget（无 RESP、无 payload），cid 固定为 0。
+/// PHP 进程退出（MSHUTDOWN）时发给所用过的 worker——见 `lifecycle`。
+pub fn build_goodbye_frame() -> anyhow::Result<Vec<u8>> {
+    let mut frame = BytesMut::new();
+    encode_frame(FrameType::Goodbye, 0, &[], &mut frame)
+        .map_err(|e| anyhow::anyhow!("encode Goodbye frame: {e}"))?;
+    Ok(frame.to_vec())
+}
+
 /// Unsubscribe 是 fire-and-forget（无 RESP），cid 固定为 0。
 pub fn build_unsubscribe_frame(subscription_id: u64) -> anyhow::Result<Vec<u8>> {
     let req = UnsubscribeReq { subscription_id };

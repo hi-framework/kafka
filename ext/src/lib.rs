@@ -19,6 +19,7 @@ mod client_interface;
 mod cluster_replay;
 mod ini_config;
 mod ipc;
+mod lifecycle;
 mod pool;
 mod protocol;
 mod spawn;
@@ -289,6 +290,26 @@ pub fn hi_kafka_commit(subscription_id: i64, timeout_ms: Option<i64>) -> PhpResu
 pub fn hi_kafka_unsubscribe(subscription_id: i64) -> PhpResult<()> {
     subscription::unsubscribe(subscription_id as u64).map_err(ipc_err_to_php)?;
     Ok(())
+}
+
+/// **@internal**（给协程 driver 用）：登记一个协程 driver 创建的订阅 real_id。
+///
+/// Swoole/Swow driver 的订阅由 PHP 层管理、不进 Rust `subscription` 注册表，进程退出
+/// 时 MSHUTDOWN 默认看不到、无法 unsubscribe → worker 活跃订阅不归零 → Goodbye 被挡。
+/// driver 在 `subscribe` 成功后调本函数登记，MSHUTDOWN 即会主动 unsubscribe，让协程
+/// 消费者进程退出也能亚秒触发 worker 自退。阻塞 `Client` 无需调用（其订阅已在注册表里）。
+#[php_function]
+pub fn hi_kafka_track_subscription(subscription_id: i64, socket: Option<String>) {
+    let socket = resolve_socket(socket.as_deref());
+    lifecycle::track_subscription(&socket, subscription_id as u64);
+}
+
+/// **@internal**（给协程 driver 用）：注销一个订阅登记（driver 主动 `unsubscribe` 后调），
+/// 与 [`hi_kafka_track_subscription`] 配对，避免 MSHUTDOWN 重复 unsubscribe 已退订的订阅。
+#[php_function]
+pub fn hi_kafka_untrack_subscription(subscription_id: i64, socket: Option<String>) {
+    let socket = resolve_socket(socket.as_deref());
+    lifecycle::untrack_subscription(&socket, subscription_id as u64);
 }
 
 /// 扩展端 consumer 自愈重订阅统计。
@@ -1115,7 +1136,19 @@ fn module_startup() {
     ini_config::register(module_number);
 }
 
+/// MSHUTDOWN 钩子：PHP 进程退出时主动通知所用过的 worker 自退（见 [`lifecycle`]）。
+///
+/// 不与 `#[php_class]` 的自动 class 注册冲突——那套逻辑挂在 module **startup**，
+/// 这里只设 module **shutdown**（`module_shutdown_func` 默认 None，无被覆盖之虞）。
+///
+/// `extern "C"`：跨 FFI 边界 panic 是 UB，用 `catch_unwind` 把任何意外 unwind 兜在
+/// Rust 侧；清理本就是 best-effort，失败无所谓。返回 PHP 约定的 SUCCESS(0)。
+extern "C" fn module_shutdown(_type: i32, _module_number: i32) -> i32 {
+    let _ = std::panic::catch_unwind(lifecycle::on_module_shutdown);
+    0
+}
+
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
-    module
+    module.shutdown_function(module_shutdown)
 }
