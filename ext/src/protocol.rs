@@ -5,7 +5,8 @@
 
 use bytes::BytesMut;
 use hi_kafka_proto::{
-    codec, encode_frame, CommitReq, CommitResp, ConsumerMessage, FrameType, HelloReq, HelloResp,
+    codec, encode_frame, CommitReq, CommitResp, ConsumerMessage, ErrorResp, FrameType, HelloReq,
+    HelloResp,
     OffsetCommit, OffsetSpec, PartitionSpec, PauseResumeOp, PauseResumeReq, PauseResumeResp,
     PayloadError, PollRebalanceReq, PollRebalanceResp, PollReq, PollResp, ProduceFnf, ProduceResp,
     RebalanceEvent, RegisterClusterReq, RegisterClusterResp, SeekReq, SeekResp, SendOffsetsReq,
@@ -22,6 +23,40 @@ pub fn next_cid() -> u64 {
 
 pub fn header_len() -> usize {
     HEADER_LEN
+}
+
+/// `Error` 帧解析结果（供 PHP 协程 driver 用）。
+pub struct ParsedError {
+    pub kind: u16,
+    pub kind_name: &'static str,
+    pub retryable: bool,
+    pub native_code: i32,
+    pub message: String,
+}
+
+/// 解析完整 `Error` 帧（13B header + `ErrorResp` payload）。
+pub fn parse_error_frame(bytes: &[u8]) -> anyhow::Result<ParsedError> {
+    if bytes.len() < HEADER_LEN {
+        anyhow::bail!("error frame too short: {} < {}", bytes.len(), HEADER_LEN);
+    }
+    let h = codec::decode_header(&bytes[..HEADER_LEN])
+        .map_err(|e| anyhow::anyhow!("decode error frame header: {e}"))?;
+    if h.kind != FrameType::Error {
+        anyhow::bail!("expected Error frame, got {:?}", h.kind);
+    }
+    let need = HEADER_LEN + h.payload_len as usize;
+    if bytes.len() < need {
+        anyhow::bail!("error frame truncated: {} < {}", bytes.len(), need);
+    }
+    let er = ErrorResp::decode(&bytes[HEADER_LEN..need])
+        .map_err(|e| anyhow::anyhow!("decode ErrorResp: {e}"))?;
+    Ok(ParsedError {
+        kind: er.kind.as_u16(),
+        kind_name: er.kind.as_str(),
+        retryable: er.retryable,
+        native_code: er.native_code,
+        message: er.message,
+    })
 }
 
 // === HELLO 握手 =============================================================

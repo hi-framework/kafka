@@ -45,7 +45,7 @@ impl Client {
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         let cfg_vec: Vec<(String, String)> = config.into_iter().collect();
         ipc::register_cluster(&self.socket, cluster, cfg_vec, timeout)
-            .map_err(|e| PhpException::default(e.to_string()))
+            .map_err(super::ipc_err_to_php)
     }
 
     /// 显式拉起 worker（如果还没在跑）。
@@ -72,7 +72,7 @@ impl Client {
     ) -> PhpResult<()> {
         let opts = super::build_options(Some(headers), partition, timestamp_ms);
         ipc::produce_fnf(&self.socket, cluster, topic, key, value, opts)
-            .map_err(|e| PhpException::default(e.to_string()))
+            .map_err(super::ipc_err_to_php)
     }
 
     /// 同步生产，等 broker ack。返回 `['ok' => bool, ...]` 数组。
@@ -90,7 +90,7 @@ impl Client {
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         let opts = super::build_options(Some(headers), partition, timestamp_ms);
         let resp = ipc::produce_sync(&self.socket, cluster, topic, key, value, opts, timeout)
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(super::ipc_err_to_php)?;
         resp_to_zval(resp)
     }
 
@@ -123,7 +123,7 @@ impl Client {
             timestamp_ms: timestamp_ms.unwrap_or(-1),
         };
         ipc::produce_fnf_bin(&self.socket, cluster, topic, &key_vec, &value_vec, opts)
-            .map_err(|e| PhpException::default(e.to_string()))
+            .map_err(super::ipc_err_to_php)
     }
 
     /// Binary-safe 同步生产。参数同 `produceFnfBin` + `$timeoutMs`。
@@ -160,7 +160,7 @@ impl Client {
             opts,
             timeout,
         )
-        .map_err(|e| PhpException::default(e.to_string()))?;
+        .map_err(super::ipc_err_to_php)?;
         resp_to_zval(resp)
     }
 
@@ -178,7 +178,7 @@ impl Client {
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         let cfg_vec: Vec<(String, String)> = config.unwrap_or_default().into_iter().collect();
         let id = subscription::subscribe(&self.socket, cluster, group_id, topics, cfg_vec, timeout)
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(super::ipc_err_to_php)?;
         Ok(id as i64)
     }
 
@@ -194,7 +194,7 @@ impl Client {
             max_messages.max(1) as u32,
             timeout_ms.max(0) as u32,
         )
-        .map_err(|e| PhpException::default(e.to_string()))?;
+        .map_err(super::ipc_err_to_php)?;
         super::messages_to_zval(messages)
     }
 
@@ -202,13 +202,13 @@ impl Client {
     pub fn commit(&self, subscription_id: i64, timeout_ms: Option<i64>) -> PhpResult<()> {
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         subscription::commit(subscription_id as u64, timeout)
-            .map_err(|e| PhpException::default(e.to_string()))
+            .map_err(super::ipc_err_to_php)
     }
 
     /// 退订。幂等。
     pub fn unsubscribe(&self, subscription_id: i64) -> PhpResult<()> {
         subscription::unsubscribe(subscription_id as u64)
-            .map_err(|e| PhpException::default(e.to_string()))
+            .map_err(super::ipc_err_to_php)
     }
 
     /// 开启事务。集群配置须含 `transactional.id`。
@@ -218,7 +218,7 @@ impl Client {
     pub fn begin_transaction(&self, cluster: &str, timeout_ms: Option<i64>) -> PhpResult<()> {
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1) as u64);
         ipc::txn(&self.socket, cluster, hi_kafka_proto::TxnOp::Begin, timeout)
-            .map_err(|e| PhpException::default(e.to_string()))
+            .map_err(super::ipc_err_to_php)
     }
 
     /// 提交事务。原子写入所有 in-flight 消息。
@@ -230,14 +230,14 @@ impl Client {
             hi_kafka_proto::TxnOp::Commit,
             timeout,
         )
-        .map_err(|e| PhpException::default(e.to_string()))
+        .map_err(super::ipc_err_to_php)
     }
 
     /// 回滚事务。in-flight 消息从 `read_committed` consumer 不可见。
     pub fn abort_transaction(&self, cluster: &str, timeout_ms: Option<i64>) -> PhpResult<()> {
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1) as u64);
         ipc::txn(&self.socket, cluster, hi_kafka_proto::TxnOp::Abort, timeout)
-            .map_err(|e| PhpException::default(e.to_string()))
+            .map_err(super::ipc_err_to_php)
     }
 
     /// 按 offset 显式 seek。
@@ -258,7 +258,7 @@ impl Client {
         let parsed = super::build_offset_targets(topics, partitions, offsets)
             .map_err(PhpException::default)?;
         ipc::seek_by_offset(&self.socket, subscription_id as u64, parsed, timeout)
-            .map_err(|e| PhpException::default(e.to_string()))
+            .map_err(super::ipc_err_to_php)
     }
 
     /// 按 timestamp seek。`$topics` 和 `$partitions` 均空 → 应用到当前 assignment 全部分区。
@@ -282,7 +282,7 @@ impl Client {
             parsed,
             timeout,
         )
-        .map_err(|e| PhpException::default(e.to_string()))
+        .map_err(super::ipc_err_to_php)
     }
 
     /// 为指定 cluster 推送 SASL/OAUTHBEARER token。
@@ -317,7 +317,7 @@ impl Client {
             ext_vec,
             timeout,
         )
-        .map_err(|e| PhpException::default(e.to_string()))
+        .map_err(super::ipc_err_to_php)
     }
 
     /// 暂停一组分区的 fetch（不丢分区分配，不触发 rebalance）。
@@ -346,7 +346,7 @@ impl Client {
             parsed,
             timeout,
         )
-        .map_err(|e| PhpException::default(e.to_string()))
+        .map_err(super::ipc_err_to_php)
     }
 
     /// 恢复被 `pause` 暂停的分区。从上次 fetch 位置继续，不重复消费。
@@ -367,7 +367,7 @@ impl Client {
             parsed,
             timeout,
         )
-        .map_err(|e| PhpException::default(e.to_string()))
+        .map_err(super::ipc_err_to_php)
     }
 
     /// 把 consumer offsets 提交进当前 producer 事务（exactly-once stream 处理）。
@@ -404,7 +404,7 @@ impl Client {
             parsed,
             timeout,
         )
-        .map_err(|e| PhpException::default(e.to_string()))
+        .map_err(super::ipc_err_to_php)
     }
 
     /// 拉取 rebalance 事件队列（最多 `$maxEvents` 条）。空队列返回空数组。
@@ -424,7 +424,7 @@ impl Client {
         let max = max_events.unwrap_or(100).max(1) as u32;
         let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
         let events = ipc::poll_rebalance(&self.socket, subscription_id as u64, max, timeout)
-            .map_err(|e| PhpException::default(e.to_string()))?;
+            .map_err(super::ipc_err_to_php)?;
         super::rebalance_events_to_zval(events)
     }
 }

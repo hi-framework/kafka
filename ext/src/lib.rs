@@ -34,6 +34,94 @@ use ext_php_rs::types::{ZendHashTable, Zval};
 
 pub use client::Client;
 
+/// `Hi\Kafka\KafkaException` —— 所有 Kafka 操作失败抛出的统一异常。
+/// `extends \Exception`，额外携带机器可读的错误分类（见 proto `ErrorKind`），
+/// 让业务能 `catch (KafkaException $e)` 后按 `$e->getKind()` / `$e->isRetryable()`
+/// 精确处理，而非靠 message 字符串匹配。
+#[php_class(name = "Hi\\Kafka\\KafkaException")]
+#[extends(ext_php_rs::zend::ce::exception())]
+#[derive(Debug)]
+pub struct KafkaException {
+    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
+    message: String,
+    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
+    code: i64,
+    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
+    kind: i64,
+    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
+    kind_name: String,
+    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
+    retryable: bool,
+    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
+    native_code: i64,
+}
+
+#[php_impl]
+impl KafkaException {
+    /// 供 PHP（协程 driver）构造：
+    /// `new KafkaException($msg, $kind, $kindName, $retryable, $nativeCode)`。
+    pub fn __construct(
+        message: String,
+        kind: i64,
+        kind_name: String,
+        retryable: bool,
+        native_code: i64,
+    ) -> Self {
+        Self {
+            message,
+            code: kind,
+            kind,
+            kind_name,
+            retryable,
+            native_code,
+        }
+    }
+
+    /// 机器可读错误大类（数值，见 `ErrorKind`）。
+    pub fn get_kind(&self) -> i64 {
+        self.kind
+    }
+    /// 错误大类名（如 `"BROKER_RETRYABLE"` / `"AUTHN_AUTHZ"`）。
+    pub fn get_kind_name(&self) -> String {
+        self.kind_name.clone()
+    }
+    /// 是否值得重试。
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+    /// 原生 librdkafka 错误码（无则 0）。
+    pub fn get_native_code(&self) -> i64 {
+        self.native_code
+    }
+}
+
+/// 把 IPC 错误转成 PHP 异常：worker 回的结构化错误（`Error` 帧）→ 带 kind 的
+/// `KafkaException` 实例；其余（本地 IO / spawn / 协议错乱）→ 通用 `PhpException`。
+pub(crate) fn ipc_err_to_php(e: ipc::IpcError) -> PhpException {
+    if let ipc::IpcError::Worker {
+        kind,
+        retryable,
+        native_code,
+        message,
+    } = &e
+    {
+        let ex = KafkaException {
+            message: message.clone(),
+            code: kind.as_u16() as i64,
+            kind: kind.as_u16() as i64,
+            kind_name: kind.as_str().to_string(),
+            retryable: *retryable,
+            native_code: *native_code as i64,
+        };
+        if let Ok(zv) = ex.into_zval(true) {
+            let mut ph = PhpException::from_class::<KafkaException>(message.clone());
+            ph.set_object(Some(zv));
+            return ph;
+        }
+    }
+    PhpException::default(e.to_string())
+}
+
 /// 默认 Unix socket 路径。所有 `socket` 参数缺省时使用此值。
 /// 可通过环境变量 `HI_KAFKA_SOCKET` 覆盖（仅在扩展首次解析时读取）。
 pub(crate) const DEFAULT_SOCKET: &str = "/tmp/hi-kafka.sock";
@@ -82,8 +170,7 @@ pub fn hi_kafka_register_cluster(
     let socket = resolve_socket(socket.as_deref());
     let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
     let cfg_vec: Vec<(String, String)> = config.into_iter().collect();
-    ipc::register_cluster(&socket, cluster, cfg_vec, timeout)
-        .map_err(|e| PhpException::default(e.to_string()))?;
+    ipc::register_cluster(&socket, cluster, cfg_vec, timeout).map_err(ipc_err_to_php)?;
     Ok(())
 }
 
@@ -106,8 +193,7 @@ pub fn hi_kafka_produce_fnf(
 ) -> PhpResult<()> {
     let socket = resolve_socket(socket.as_deref());
     let opts = build_options(headers, partition, timestamp_ms);
-    ipc::produce_fnf(&socket, cluster, topic, key, value, opts)
-        .map_err(|e| PhpException::default(e.to_string()))
+    ipc::produce_fnf(&socket, cluster, topic, key, value, opts).map_err(ipc_err_to_php)
 }
 
 /// 同步带 ack 全局函数 API。参数同 [`hi_kafka_produce_fnf`] + `timeout_ms`。
@@ -127,7 +213,7 @@ pub fn hi_kafka_produce_sync(
     let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
     let opts = build_options(headers, partition, timestamp_ms);
     let resp = ipc::produce_sync(&socket, cluster, topic, key, value, opts, timeout)
-        .map_err(|e| PhpException::default(e.to_string()))?;
+        .map_err(ipc_err_to_php)?;
     client::resp_to_zval(resp)
 }
 
@@ -174,7 +260,7 @@ pub fn hi_kafka_subscribe(
     let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
     let cfg_vec: Vec<(String, String)> = config.unwrap_or_default().into_iter().collect();
     let id = subscription::subscribe(&socket, cluster, group_id, topics, cfg_vec, timeout)
-        .map_err(|e| PhpException::default(e.to_string()))?;
+        .map_err(ipc_err_to_php)?;
     Ok(id as i64)
 }
 
@@ -186,7 +272,7 @@ pub fn hi_kafka_poll(subscription_id: i64, max_messages: i64, timeout_ms: i64) -
         max_messages.max(1) as u32,
         timeout_ms.max(0) as u32,
     )
-    .map_err(|e| PhpException::default(e.to_string()))?;
+    .map_err(ipc_err_to_php)?;
     messages_to_zval(messages)
 }
 
@@ -194,16 +280,14 @@ pub fn hi_kafka_poll(subscription_id: i64, max_messages: i64, timeout_ms: i64) -
 #[php_function]
 pub fn hi_kafka_commit(subscription_id: i64, timeout_ms: Option<i64>) -> PhpResult<()> {
     let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
-    subscription::commit(subscription_id as u64, timeout)
-        .map_err(|e| PhpException::default(e.to_string()))?;
+    subscription::commit(subscription_id as u64, timeout).map_err(ipc_err_to_php)?;
     Ok(())
 }
 
 /// 退订。幂等，对已不存在的 virtual_id 直接返回。
 #[php_function]
 pub fn hi_kafka_unsubscribe(subscription_id: i64) -> PhpResult<()> {
-    subscription::unsubscribe(subscription_id as u64)
-        .map_err(|e| PhpException::default(e.to_string()))?;
+    subscription::unsubscribe(subscription_id as u64).map_err(ipc_err_to_php)?;
     Ok(())
 }
 
@@ -520,6 +604,29 @@ pub fn hi_kafka_next_cid() -> i64 {
 #[php_function]
 pub fn hi_kafka_header_len() -> i64 {
     protocol::header_len() as i64
+}
+
+/// `Error` 帧的帧类型字节（`0x40`）。PHP driver 用 `hi_kafka_parse_header` 拿到 kind
+/// 后与它比较，判断该帧是否要走 `hi_kafka_decode_error_frame` + 抛 KafkaException。
+#[php_function]
+pub fn hi_kafka_error_frame_kind() -> i64 {
+    hi_kafka_proto::FrameType::Error as u8 as i64
+}
+
+/// 解析完整 `Error` 帧 →
+/// `['kind'=>int, 'kind_name'=>str, 'retryable'=>bool, 'native_code'=>int, 'message'=>str]`。
+#[php_function]
+pub fn hi_kafka_decode_error_frame(bytes: BinarySlice<u8>) -> PhpResult<Zval> {
+    let pe =
+        protocol::parse_error_frame(&bytes).map_err(|e| PhpException::default(e.to_string()))?;
+    let mut ht = ZendHashTable::new();
+    put(&mut ht, "kind", pe.kind as i64)?;
+    put(&mut ht, "kind_name", pe.kind_name)?;
+    put(&mut ht, "retryable", pe.retryable)?;
+    put(&mut ht, "native_code", pe.native_code as i64)?;
+    put(&mut ht, "message", pe.message.as_str())?;
+    ht.into_zval(false)
+        .map_err(|e| PhpException::default(format!("into_zval: {e}")))
 }
 
 /// 编一帧 HELLO（协议握手）。返回完整 14B 帧字节（PHP binary string）。
