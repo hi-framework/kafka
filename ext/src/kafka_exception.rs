@@ -32,6 +32,8 @@ static EXC_CE: OnceLock<CeRef> = OnceLock::new();
 
 // === getter 方法（读 $this 公开属性）===
 // 手动 ClassBuilder 没有 Rust struct，方法经 ExecuteData 拿 $this、读属性、写返回值。
+// 不设自定义 `__construct`：继承 `\Exception` 的 `($message, $code = kind)`，分类信息由
+// 抛出方（`build_zval` / 协程 driver `makeKafka`）在构造后写入公开属性。
 
 zend_fastcall! {
     extern fn get_kind(ex: &mut ExecuteData, retval: &mut Zval) {
@@ -115,8 +117,8 @@ pub fn register() {
 ///
 /// 流程：
 /// 1. `ce.new()` 经（继承自 `\Exception` 的）`create_object` 创建对象 → 捕获 trace/file/line；
-/// 2. 调 `\Exception::__construct(message, code=kind)` 设 message/code（内部作用域，正确写保护属性）；
-/// 3. 设 4 个公开分类属性。
+/// 2. 调（继承的）`\Exception::__construct(message, code=kind)` 设 message/code；
+/// 3. `set_property` 设 4 个公开分类属性。
 ///
 /// 任一步失败返回 `None`，调用方回退到通用 `PhpException`（至少消息不丢）。
 pub fn build_zval(
@@ -129,7 +131,6 @@ pub fn build_zval(
     let ce = EXC_CE.get().map(|r| r.0)?;
     // ce.new() 经继承自 \Exception 的 create_object 创建对象 ZBox<ZendObject> → 捕获调用栈。
     let mut obj = ce.new();
-    // 调 \Exception::__construct(message, code) 设 message/code。
     // owned 绑定确保参数 zval 生命周期覆盖调用。
     let msg = message.to_string();
     obj.try_call_method("__construct", vec![&msg, &kind]).ok()?;
