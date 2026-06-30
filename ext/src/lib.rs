@@ -19,6 +19,7 @@ mod client_interface;
 mod cluster_replay;
 mod ini_config;
 mod ipc;
+mod kafka_exception;
 mod lifecycle;
 mod pool;
 mod protocol;
@@ -35,69 +36,12 @@ use ext_php_rs::types::{ZendHashTable, Zval};
 
 pub use client::Client;
 
-/// `Hi\Kafka\KafkaException` —— 所有 Kafka 操作失败抛出的统一异常。
-/// `extends \Exception`，额外携带机器可读的错误分类（见 proto `ErrorKind`），
-/// 让业务能 `catch (KafkaException $e)` 后按 `$e->getKind()` / `$e->isRetryable()`
-/// 精确处理，而非靠 message 字符串匹配。
-#[php_class(name = "Hi\\Kafka\\KafkaException")]
-#[extends(ext_php_rs::zend::ce::exception())]
-#[derive(Debug)]
-pub struct KafkaException {
-    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
-    message: String,
-    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
-    code: i64,
-    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
-    kind: i64,
-    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
-    kind_name: String,
-    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
-    retryable: bool,
-    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
-    native_code: i64,
-}
-
-#[php_impl]
-impl KafkaException {
-    /// 供 PHP（协程 driver）构造：
-    /// `new KafkaException($msg, $kind, $kindName, $retryable, $nativeCode)`。
-    pub fn __construct(
-        message: String,
-        kind: i64,
-        kind_name: String,
-        retryable: bool,
-        native_code: i64,
-    ) -> Self {
-        Self {
-            message,
-            code: kind,
-            kind,
-            kind_name,
-            retryable,
-            native_code,
-        }
-    }
-
-    /// 机器可读错误大类（数值，见 `ErrorKind`）。
-    pub fn get_kind(&self) -> i64 {
-        self.kind
-    }
-    /// 错误大类名（如 `"BROKER_RETRYABLE"` / `"AUTHN_AUTHZ"`）。
-    pub fn get_kind_name(&self) -> String {
-        self.kind_name.clone()
-    }
-    /// 是否值得重试。
-    pub fn is_retryable(&self) -> bool {
-        self.retryable
-    }
-    /// 原生 librdkafka 错误码（无则 0）。
-    pub fn get_native_code(&self) -> i64 {
-        self.native_code
-    }
-}
-
-/// 把 IPC 错误转成 PHP 异常：worker 回的结构化错误（`Error` 帧）→ 带 kind 的
-/// `KafkaException` 实例；其余（本地 IO / spawn / 协议错乱）→ 通用 `PhpException`。
+/// 把 IPC 错误转成 PHP 异常：worker 回的结构化错误（`Error` 帧）→ 带 kind + **真实调用栈**
+/// 的 `Hi\Kafka\KafkaException`（见 [`kafka_exception`]）；其余（本地 IO / spawn / 协议
+/// 错乱）→ 通用 `PhpException`。
+///
+/// 分类以公开属性暴露：`$e->kind` / `$e->kind_name` / `$e->retryable` / `$e->native_code`
+/// （`$e->getCode()` 亦 = kind）。
 pub(crate) fn ipc_err_to_php(e: ipc::IpcError) -> PhpException {
     if let ipc::IpcError::Worker {
         kind,
@@ -106,16 +50,19 @@ pub(crate) fn ipc_err_to_php(e: ipc::IpcError) -> PhpException {
         message,
     } = &e
     {
-        let ex = KafkaException {
-            message: message.clone(),
-            code: kind.as_u16() as i64,
-            kind: kind.as_u16() as i64,
-            kind_name: kind.as_str().to_string(),
-            retryable: *retryable,
-            native_code: *native_code as i64,
-        };
-        if let Ok(zv) = ex.into_zval(true) {
-            let mut ph = PhpException::from_class::<KafkaException>(message.clone());
+        if let Some(zv) = kafka_exception::build_zval(
+            message,
+            kind.as_u16() as i64,
+            kind.as_str(),
+            *retryable,
+            *native_code as i64,
+        ) {
+            // set_object 会让 throw 走 throw_object(zv)，所以这里的 ce 仅作占位。
+            let mut ph = PhpException::new(
+                message.clone(),
+                kind.as_u16() as i32,
+                ext_php_rs::zend::ce::exception(),
+            );
             ph.set_object(Some(zv));
             return ph;
         }
@@ -1133,6 +1080,7 @@ fn put<V: IntoZval>(ht: &mut ZendHashTable, key: &str, value: V) -> PhpResult<()
 #[php_startup(before)]
 fn module_startup() {
     client_interface::register();
+    kafka_exception::register();
     ini_config::register(module_number);
 }
 
