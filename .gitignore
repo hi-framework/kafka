@@ -9,6 +9,7 @@
 /tmp/
 /dist
 /vendor
+/ext-kafka
 
 # Sub-package
 php-driver/
