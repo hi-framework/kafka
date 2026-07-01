@@ -528,14 +528,29 @@ impl Consumer for KafkaConsumer {
             .clone();
         let consumer = state.consumer.clone();
         // rdkafka commit 是同步阻塞调用，放 spawn_blocking
-        tokio::task::spawn_blocking(move || consumer.commit_consumer_state(CommitMode::Sync))
-            .await
-            .context("spawn_blocking commit")
-            .map_err(ConsumerError::Backend)?
-            .context("commit")
-            .map_err(ConsumerError::Backend)?;
-        debug!(?sub, "committed");
-        Ok(())
+        let commit_result =
+            tokio::task::spawn_blocking(move || consumer.commit_consumer_state(CommitMode::Sync))
+                .await
+                .context("spawn_blocking commit")
+                .map_err(ConsumerError::Backend)?;
+        match commit_result {
+            Ok(()) => {
+                debug!(?sub, "committed");
+                Ok(())
+            }
+            // librdkafka 约定：`_NO_OFFSET` 不是错误，而是"这次没有新 offset 需要提交"
+            // （通常发生在消费到 LOG_END_OFFSET 之后再次 commit，或分区上还没消费过
+            // 任何消息）。对应用层是无操作，直接返回 Ok，避免业务侧反复见到"error"。
+            Err(rdkafka::error::KafkaError::ConsumerCommit(
+                rdkafka::error::RDKafkaErrorCode::NoOffset,
+            )) => {
+                debug!(?sub, "commit noop: no stored offsets to commit");
+                Ok(())
+            }
+            Err(e) => Err(ConsumerError::Backend(
+                anyhow::Error::new(e).context("commit"),
+            )),
+        }
     }
 
     async fn unsubscribe(&self, sub: SubscriptionId) -> Result<(), ConsumerError> {

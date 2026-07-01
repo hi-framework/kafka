@@ -491,3 +491,161 @@ fn is_retryable(code: &RDKafkaErrorCode) -> bool {
             | ConcurrentTransactions // 事务客户端互相阻塞，重试可以放行
     )
 }
+
+// ============================================================================
+// 单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rdkafka::error::RDKafkaErrorCode;
+    use rdkafka::message::Headers; // 为 OwnedHeaders.count() 提供 trait
+
+    // === is_retryable ===================================================
+
+    #[test]
+    fn test_is_retryable_true_for_transient() {
+        use RDKafkaErrorCode::*;
+        for c in [
+            RequestTimedOut,
+            NetworkException,
+            LeaderNotAvailable,
+            NotLeaderForPartition,
+            BrokerNotAvailable,
+            ReplicaNotAvailable,
+            KafkaStorageError,
+            QueueFull,
+            RebalanceInProgress,
+            UnknownTopicOrPartition,
+            ConcurrentTransactions,
+        ] {
+            assert!(is_retryable(&c), "{c:?} 应可重试");
+        }
+    }
+
+    #[test]
+    fn test_is_retryable_false_for_permanent() {
+        use RDKafkaErrorCode::*;
+        // 永久性错误：认证 / 消息过大 / 无效分区数等
+        for c in [
+            SaslAuthenticationFailed,
+            TopicAuthorizationFailed,
+            GroupAuthorizationFailed,
+            ClusterAuthorizationFailed,
+            MessageSizeTooLarge,
+            InvalidPartitions,
+            InvalidTopic,
+        ] {
+            assert!(!is_retryable(&c), "{c:?} 不应可重试");
+        }
+    }
+
+    // === kafka_error_to_kind ============================================
+
+    #[test]
+    fn test_kafka_error_to_kind_authnz() {
+        use RDKafkaErrorCode::*;
+        for c in [
+            SaslAuthenticationFailed,
+            TopicAuthorizationFailed,
+            GroupAuthorizationFailed,
+            ClusterAuthorizationFailed,
+        ] {
+            let err = KafkaError::MessageProduction(c);
+            assert_eq!(kafka_error_to_kind(&err), ErrorKind::AuthnAuthz);
+        }
+    }
+
+    #[test]
+    fn test_kafka_error_to_kind_message_too_large() {
+        let err = KafkaError::MessageProduction(RDKafkaErrorCode::MessageSizeTooLarge);
+        assert_eq!(kafka_error_to_kind(&err), ErrorKind::MessageTooLarge);
+    }
+
+    #[test]
+    fn test_kafka_error_to_kind_unknown_topic() {
+        let err = KafkaError::MessageProduction(RDKafkaErrorCode::UnknownTopicOrPartition);
+        assert_eq!(kafka_error_to_kind(&err), ErrorKind::UnknownTopicOrPartition);
+    }
+
+    #[test]
+    fn test_kafka_error_to_kind_retryable_maps_to_broker_retryable() {
+        // 可重试类应聚合到 BrokerRetryable（业务侧统一 retry 策略入口）
+        for c in [
+            RDKafkaErrorCode::RequestTimedOut,
+            RDKafkaErrorCode::LeaderNotAvailable,
+            RDKafkaErrorCode::QueueFull,
+        ] {
+            let err = KafkaError::MessageProduction(c);
+            assert_eq!(
+                kafka_error_to_kind(&err),
+                ErrorKind::BrokerRetryable,
+                "{c:?} 应映射为 BrokerRetryable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kafka_error_to_kind_non_production_returns_internal() {
+        // AdminOpCreation 等非 producer 路径的错误直接 fallback Internal
+        let err = KafkaError::AdminOpCreation("some admin op".into());
+        assert_eq!(kafka_error_to_kind(&err), ErrorKind::Internal);
+    }
+
+    // === kafka_error_to_worker ==========================================
+
+    #[test]
+    fn test_kafka_error_to_worker_preserves_native_code_and_retryable() {
+        let err = KafkaError::MessageProduction(RDKafkaErrorCode::LeaderNotAvailable);
+        let w = kafka_error_to_worker(&err);
+        assert_eq!(w.kind, ErrorKind::BrokerRetryable);
+        assert!(w.retryable, "LeaderNotAvailable 应 retryable=true");
+        assert_eq!(
+            w.native_code,
+            RDKafkaErrorCode::LeaderNotAvailable as i32,
+            "native_code 直接透传"
+        );
+        assert!(w.message.to_lowercase().contains("leader"));
+    }
+
+    #[test]
+    fn test_kafka_error_to_worker_permanent_error() {
+        let err = KafkaError::MessageProduction(RDKafkaErrorCode::MessageSizeTooLarge);
+        let w = kafka_error_to_worker(&err);
+        assert_eq!(w.kind, ErrorKind::MessageTooLarge);
+        assert!(!w.retryable, "MessageSizeTooLarge 是永久错");
+    }
+
+    // === build_headers ===================================================
+
+    #[test]
+    fn test_build_headers_none_when_empty() {
+        let headers: Vec<hi_kafka_proto::MessageHeader> = vec![];
+        assert!(
+            build_headers(&headers).is_none(),
+            "空 headers 应返回 None，避免给 rdkafka 发空段"
+        );
+    }
+
+    #[test]
+    fn test_build_headers_preserves_keys_and_values() {
+        let headers: Vec<hi_kafka_proto::MessageHeader> = vec![
+            ("trace-id".into(), bytes::Bytes::from_static(b"abc123")),
+            ("source".into(), bytes::Bytes::from_static(b"svc-a")),
+        ];
+        let owned = build_headers(&headers).expect("非空 headers 应 Some");
+        assert_eq!(owned.count(), 2, "两个 header 都应保留");
+    }
+
+    #[test]
+    fn test_build_headers_binary_safe_values() {
+        // header value 含 null / 0xff 应完整保留（binary-safe）
+        let headers: Vec<hi_kafka_proto::MessageHeader> = vec![(
+            "raw".into(),
+            bytes::Bytes::from_static(b"a\x00b\xff"),
+        )];
+        let owned = build_headers(&headers).unwrap();
+        assert_eq!(owned.count(), 1);
+    }
+}
