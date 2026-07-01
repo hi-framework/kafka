@@ -50,14 +50,17 @@ SWOOLE_SO="$(detect_ext_so swoole SWOOLE_SO_PATH)"
 
 # 默认全跑（除掉以 _ 开头的辅助脚本）
 ALL_TESTS=(
+    auto-backpressure
     binary
     configs
     consumer-in-txn
     consumer-recovery
     control-recovery
+    exception-fields
     headers
     integration
     oauth-smoke
+    panic-recovery
     partition-timestamp
     pause-resume
     rebalance
@@ -115,6 +118,9 @@ for t in $TESTS; do
     extra_args=""
     # extra_php_opts 用字符串而不是数组，避免 `set -u` 下空数组展开报错
     extra_php_opts=""
+    # 用字符串而非数组承载额外 env——兼容 macOS bash 3.2 + `set -u`
+    # 下的空数组展开陷阱（extra_env[@]: unbound variable）。
+    extra_env=""
     case "$t" in
         integration) extra_args="--with-kafka" ;;
         swoole-client|swoole-phase3)
@@ -125,11 +131,22 @@ for t in $TESTS; do
             fi
             extra_php_opts="-d extension=$SWOOLE_SO"
             ;;
+        auto-backpressure)
+            # 自动背压：小缓冲 + 低水位，确保 500 条大 payload 能触发 auto-pause
+            # 每个 e2e 独立 metrics 端口，避免并发端口冲突
+            metrics_port=$((9500 + RANDOM % 500))
+            extra_env="HI_KAFKA_METRICS_ADDR=127.0.0.1:${metrics_port} \
+                HI_KAFKA_CONSUMER_BUFFER_CAPACITY=200 \
+                HI_KAFKA_CONSUMER_PAUSE_AT=160 \
+                HI_KAFKA_CONSUMER_RESUME_AT=40"
+            ;;
     esac
     # HI_KAFKA_EXT_PATH 给那些会 spawn 独立 PHP 进程的测试用（rebalance）
     # HI_KAFKA_BROKERS 给依赖默认 broker 的测试
     # -n 跳过系统 php.ini：避免 xdebug 之类的 observer 在 MSHUTDOWN 阶段崩
-    output=$(HI_KAFKA_EXT_PATH="$EXT_PATH" \
+    # shellcheck disable=SC2086
+    output=$(env $extra_env \
+        HI_KAFKA_EXT_PATH="$EXT_PATH" \
         HI_KAFKA_BROKERS="${HI_KAFKA_BROKERS:-127.0.0.1:9094}" \
         "$PHP_BIN" -n $extra_php_opts -d extension="$EXT_PATH" "$script" "$sock" "$topic_prefix" $extra_args 2>&1)
     rc=$?
