@@ -2,6 +2,12 @@
 //!
 //! 把全局的 `hi_kafka_produce_*` 函数封装成对象方法，`socket` 路径作为对象状态，
 //! 避免每次调用都传一遍。
+//!
+//! **参数命名**：方法参数刻意用 **camelCase**（`timeoutMs` / `groupId` / …）。
+//! ext-php-rs 直接把 Rust 参数标识符当 PHP 参数名（只对方法名做 snake→camel），
+//! 而 PHP 是公开 API、应遵循 camelCase 惯例并与 `ClientInterface` / `SwooleClient` /
+//! `SwowClient` 及命名参数调用方一致——故这里让 Rust 侧非惯例、换取 PHP 侧地道。
+#![allow(non_snake_case)]
 
 use crate::ipc;
 use crate::subscription;
@@ -40,9 +46,9 @@ impl Client {
         &self,
         cluster: &str,
         config: std::collections::HashMap<String, String>,
-        timeout_ms: Option<i64>,
+        timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
         let cfg_vec: Vec<(String, String)> = config.into_iter().collect();
         ipc::register_cluster(&self.socket, cluster, cfg_vec, timeout)
             .map_err(super::ipc_err_to_php)
@@ -66,11 +72,11 @@ impl Client {
         topic: &str,
         key: &str,
         value: &str,
-        headers: std::collections::HashMap<String, String>,
+        headers: Option<std::collections::HashMap<String, String>>,
         partition: Option<i64>,
-        timestamp_ms: Option<i64>,
+        timestampMs: Option<i64>,
     ) -> PhpResult<()> {
-        let opts = super::build_options(Some(headers), partition, timestamp_ms);
+        let opts = super::build_options(headers, partition, timestampMs);
         ipc::produce_fnf(&self.socket, cluster, topic, key, value, opts)
             .map_err(super::ipc_err_to_php)
     }
@@ -82,13 +88,13 @@ impl Client {
         topic: &str,
         key: &str,
         value: &str,
-        headers: std::collections::HashMap<String, String>,
+        headers: Option<std::collections::HashMap<String, String>>,
         partition: Option<i64>,
-        timestamp_ms: Option<i64>,
-        timeout_ms: Option<i64>,
+        timestampMs: Option<i64>,
+        timeoutMs: Option<i64>,
     ) -> PhpResult<Zval> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
-        let opts = super::build_options(Some(headers), partition, timestamp_ms);
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
+        let opts = super::build_options(headers, partition, timestampMs);
         let resp = ipc::produce_sync(&self.socket, cluster, topic, key, value, opts, timeout)
             .map_err(super::ipc_err_to_php)?;
         resp_to_zval(resp)
@@ -106,21 +112,21 @@ impl Client {
         topic: &str,
         key: ext_php_rs::binary::Binary<u8>,
         value: ext_php_rs::binary::Binary<u8>,
-        header_names: Vec<String>,
-        header_values: Vec<ext_php_rs::binary::Binary<u8>>,
+        headerNames: Vec<String>,
+        headerValues: Vec<ext_php_rs::binary::Binary<u8>>,
         partition: Option<i64>,
-        timestamp_ms: Option<i64>,
+        timestampMs: Option<i64>,
     ) -> PhpResult<()> {
         let key_vec: Vec<u8> = key.into();
         let value_vec: Vec<u8> = value.into();
-        let headers = super::build_binary_headers(header_names, header_values)
+        let headers = super::build_binary_headers(headerNames, headerValues)
             .map_err(PhpException::default)?;
         let opts = ipc::ProduceOptions {
             headers,
             partition: partition
                 .map(|p| p.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
                 .unwrap_or(-1),
-            timestamp_ms: timestamp_ms.unwrap_or(-1),
+            timestamp_ms: timestampMs.unwrap_or(-1),
         };
         ipc::produce_fnf_bin(&self.socket, cluster, topic, &key_vec, &value_vec, opts)
             .map_err(super::ipc_err_to_php)
@@ -133,23 +139,23 @@ impl Client {
         topic: &str,
         key: ext_php_rs::binary::Binary<u8>,
         value: ext_php_rs::binary::Binary<u8>,
-        header_names: Vec<String>,
-        header_values: Vec<ext_php_rs::binary::Binary<u8>>,
+        headerNames: Vec<String>,
+        headerValues: Vec<ext_php_rs::binary::Binary<u8>>,
         partition: Option<i64>,
-        timestamp_ms: Option<i64>,
-        timeout_ms: Option<i64>,
+        timestampMs: Option<i64>,
+        timeoutMs: Option<i64>,
     ) -> PhpResult<Zval> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
         let key_vec: Vec<u8> = key.into();
         let value_vec: Vec<u8> = value.into();
-        let headers = super::build_binary_headers(header_names, header_values)
+        let headers = super::build_binary_headers(headerNames, headerValues)
             .map_err(PhpException::default)?;
         let opts = ipc::ProduceOptions {
             headers,
             partition: partition
                 .map(|p| p.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
                 .unwrap_or(-1),
-            timestamp_ms: timestamp_ms.unwrap_or(-1),
+            timestamp_ms: timestampMs.unwrap_or(-1),
         };
         let resp = ipc::produce_sync_bin(
             &self.socket,
@@ -164,20 +170,20 @@ impl Client {
         resp_to_zval(resp)
     }
 
-    /// 订阅 topics。返回 **virtual** subscription_id（int）。
+    /// 订阅 topics。返回 **virtual** subscriptionId（int）。
     ///
     /// 自愈：worker 崩溃后续 poll/commit 自动重订阅，`$sub` 句柄全程稳定。
     pub fn subscribe(
         &self,
         cluster: &str,
-        group_id: &str,
+        groupId: &str,
         topics: Vec<String>,
         config: Option<std::collections::HashMap<String, String>>,
-        timeout_ms: Option<i64>,
+        timeoutMs: Option<i64>,
     ) -> PhpResult<i64> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
         let cfg_vec: Vec<(String, String)> = config.unwrap_or_default().into_iter().collect();
-        let id = subscription::subscribe(&self.socket, cluster, group_id, topics, cfg_vec, timeout)
+        let id = subscription::subscribe(&self.socket, cluster, groupId, topics, cfg_vec, timeout)
             .map_err(super::ipc_err_to_php)?;
         Ok(id as i64)
     }
@@ -185,29 +191,29 @@ impl Client {
     /// 拉一批消息。命中 subscription gone 时透明重订阅 + 重试。
     pub fn poll(
         &self,
-        subscription_id: i64,
-        max_messages: i64,
-        timeout_ms: i64,
+        subscriptionId: i64,
+        maxMessages: i64,
+        timeoutMs: i64,
     ) -> PhpResult<Zval> {
         let messages = subscription::poll(
-            subscription_id as u64,
-            max_messages.max(1) as u32,
-            timeout_ms.max(0) as u32,
+            subscriptionId as u64,
+            maxMessages.max(1) as u32,
+            timeoutMs.max(0) as u32,
         )
         .map_err(super::ipc_err_to_php)?;
         super::messages_to_zval(messages)
     }
 
     /// 同步提交 offset。命中 subscription gone 时透明重订阅 + 重试。
-    pub fn commit(&self, subscription_id: i64, timeout_ms: Option<i64>) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
-        subscription::commit(subscription_id as u64, timeout)
+    pub fn commit(&self, subscriptionId: i64, timeoutMs: Option<i64>) -> PhpResult<()> {
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
+        subscription::commit(subscriptionId as u64, timeout)
             .map_err(super::ipc_err_to_php)
     }
 
     /// 退订。幂等。
-    pub fn unsubscribe(&self, subscription_id: i64) -> PhpResult<()> {
-        subscription::unsubscribe(subscription_id as u64)
+    pub fn unsubscribe(&self, subscriptionId: i64) -> PhpResult<()> {
+        subscription::unsubscribe(subscriptionId as u64)
             .map_err(super::ipc_err_to_php)
     }
 
@@ -215,15 +221,15 @@ impl Client {
     ///
     /// 跨多 topic 原子写入：begin → produce* → commit / abort。
     /// 同集群同时仅一个 active tx（librdkafka 内部串行）。
-    pub fn begin_transaction(&self, cluster: &str, timeout_ms: Option<i64>) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1) as u64);
+    pub fn begin_transaction(&self, cluster: &str, timeoutMs: Option<i64>) -> PhpResult<()> {
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(30_000).max(1) as u64);
         ipc::txn(&self.socket, cluster, hi_kafka_proto::TxnOp::Begin, timeout)
             .map_err(super::ipc_err_to_php)
     }
 
     /// 提交事务。原子写入所有 in-flight 消息。
-    pub fn commit_transaction(&self, cluster: &str, timeout_ms: Option<i64>) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1) as u64);
+    pub fn commit_transaction(&self, cluster: &str, timeoutMs: Option<i64>) -> PhpResult<()> {
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(30_000).max(1) as u64);
         ipc::txn(
             &self.socket,
             cluster,
@@ -234,8 +240,8 @@ impl Client {
     }
 
     /// 回滚事务。in-flight 消息从 `read_committed` consumer 不可见。
-    pub fn abort_transaction(&self, cluster: &str, timeout_ms: Option<i64>) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1) as u64);
+    pub fn abort_transaction(&self, cluster: &str, timeoutMs: Option<i64>) -> PhpResult<()> {
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(30_000).max(1) as u64);
         ipc::txn(&self.socket, cluster, hi_kafka_proto::TxnOp::Abort, timeout)
             .map_err(super::ipc_err_to_php)
     }
@@ -248,16 +254,16 @@ impl Client {
     /// 必须在订阅已建立且 partition 已被分配后调用（建议拿到至少一次 ASSIGN 事件再调）。
     pub fn seek(
         &self,
-        subscription_id: i64,
+        subscriptionId: i64,
         topics: Vec<String>,
         partitions: Vec<i64>,
         offsets: Vec<i64>,
-        timeout_ms: Option<i64>,
+        timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(10_000).max(1) as u64);
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(10_000).max(1) as u64);
         let parsed = super::build_offset_targets(topics, partitions, offsets)
             .map_err(PhpException::default)?;
-        ipc::seek_by_offset(&self.socket, subscription_id as u64, parsed, timeout)
+        ipc::seek_by_offset(&self.socket, subscriptionId as u64, parsed, timeout)
             .map_err(super::ipc_err_to_php)
     }
 
@@ -266,19 +272,19 @@ impl Client {
     /// 两个平行数组：`$topics[i]` / `$partitions[i]` 描述要 seek 的分区。
     pub fn seek_to_timestamp(
         &self,
-        subscription_id: i64,
-        timestamp_ms: i64,
+        subscriptionId: i64,
+        timestampMs: i64,
         topics: Vec<String>,
         partitions: Vec<i64>,
-        timeout_ms: Option<i64>,
+        timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(15_000).max(1) as u64);
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(15_000).max(1) as u64);
         let parsed =
             super::build_partition_specs(topics, partitions).map_err(PhpException::default)?;
         ipc::seek_by_timestamp(
             &self.socket,
-            subscription_id as u64,
-            timestamp_ms,
+            subscriptionId as u64,
+            timestampMs,
             parsed,
             timeout,
         )
@@ -292,7 +298,7 @@ impl Client {
     /// worker 直接从 slot 读返回。token 缺失时 librdkafka 按其退避策略重试。
     ///
     /// 业务侧典型刷新策略：
-    /// - 定时器：每 `lifetime_ms - now - 5min` 触发一次再拉一次推回去
+    /// - 定时器：每 `lifetimeMs - now - 5min` 触发一次再拉一次推回去
     /// - 监听：订阅自家 token 服务的 webhook，token rotate 时立即推
     ///
     /// `$extensions` 为 SASL extension key/value（预留，rdkafka 0.38 还没透传给
@@ -301,19 +307,19 @@ impl Client {
         &self,
         cluster: &str,
         token: &str,
-        lifetime_ms: i64,
-        principal_name: &str,
-        extensions: std::collections::HashMap<String, String>,
-        timeout_ms: Option<i64>,
+        lifetimeMs: i64,
+        principalName: &str,
+        extensions: Option<std::collections::HashMap<String, String>>,
+        timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
-        let ext_vec: Vec<(String, String)> = extensions.into_iter().collect();
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
+        let ext_vec: Vec<(String, String)> = extensions.unwrap_or_default().into_iter().collect();
         ipc::set_oauth_bearer_token(
             &self.socket,
             cluster,
             token,
-            lifetime_ms,
-            principal_name,
+            lifetimeMs,
+            principalName,
             ext_vec,
             timeout,
         )
@@ -331,17 +337,17 @@ impl Client {
     /// - DLT 重放期间暂停主流
     pub fn pause(
         &self,
-        subscription_id: i64,
+        subscriptionId: i64,
         topics: Vec<String>,
         partitions: Vec<i64>,
-        timeout_ms: Option<i64>,
+        timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
         let parsed =
             super::build_partition_specs(topics, partitions).map_err(PhpException::default)?;
         ipc::pause_resume(
             &self.socket,
-            subscription_id as u64,
+            subscriptionId as u64,
             hi_kafka_proto::PauseResumeOp::Pause,
             parsed,
             timeout,
@@ -352,17 +358,17 @@ impl Client {
     /// 恢复被 `pause` 暂停的分区。从上次 fetch 位置继续，不重复消费。
     pub fn resume(
         &self,
-        subscription_id: i64,
+        subscriptionId: i64,
         topics: Vec<String>,
         partitions: Vec<i64>,
-        timeout_ms: Option<i64>,
+        timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
         let parsed =
             super::build_partition_specs(topics, partitions).map_err(PhpException::default)?;
         ipc::pause_resume(
             &self.socket,
-            subscription_id as u64,
+            subscriptionId as u64,
             hi_kafka_proto::PauseResumeOp::Resume,
             parsed,
             timeout,
@@ -385,22 +391,22 @@ impl Client {
     /// 三个平行数组：`$topics[i]` / `$partitions[i]` / `$offsets[i]`。
     pub fn send_offsets_to_transaction(
         &self,
-        producer_cluster: &str,
-        subscription_id: i64,
-        group_id: &str,
+        producerCluster: &str,
+        subscriptionId: i64,
+        groupId: &str,
         topics: Vec<String>,
         partitions: Vec<i64>,
         offsets: Vec<i64>,
-        timeout_ms: Option<i64>,
+        timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1) as u64);
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(30_000).max(1) as u64);
         let parsed = super::build_offset_targets(topics, partitions, offsets)
             .map_err(PhpException::default)?;
         ipc::send_offsets_to_transaction(
             &self.socket,
-            producer_cluster,
-            subscription_id as u64,
-            group_id,
+            producerCluster,
+            subscriptionId as u64,
+            groupId,
             parsed,
             timeout,
         )
@@ -417,13 +423,13 @@ impl Client {
     /// 在 assign 时 warm-up。
     pub fn poll_rebalance_events(
         &self,
-        subscription_id: i64,
-        max_events: Option<i64>,
-        timeout_ms: Option<i64>,
+        subscriptionId: i64,
+        maxEvents: Option<i64>,
+        timeoutMs: Option<i64>,
     ) -> PhpResult<Zval> {
-        let max = max_events.unwrap_or(100).max(1) as u32;
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(5000).max(1) as u64);
-        let events = ipc::poll_rebalance(&self.socket, subscription_id as u64, max, timeout)
+        let max = maxEvents.unwrap_or(100).max(1) as u32;
+        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
+        let events = ipc::poll_rebalance(&self.socket, subscriptionId as u64, max, timeout)
             .map_err(super::ipc_err_to_php)?;
         super::rebalance_events_to_zval(events)
     }
