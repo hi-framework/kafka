@@ -1,4 +1,6 @@
 <?php
+
+declare(strict_types=1);
 /**
  * PHP stub for `hi-kafka` extension —— **don't `require` at runtime**.
  *
@@ -36,38 +38,48 @@ namespace Hi\Kafka {
         /**
          * @param string|null $socket UDS 路径；null = `/tmp/hi-kafka.sock` 或 `HI_KAFKA_SOCKET` env
          */
-        public function __construct(?string $socket = null) {}
+        public function __construct(?string $socket = null)
+        {
+        }
 
-        /** 当前 client 的 socket 路径 */
-        public function socket(): string {}
+        /**
+         * 当前 client 的 socket 路径
+         */
+        public function socket(): string
+        {
+        }
 
         /**
          * 注册或覆盖 Kafka 集群配置（连接 / SASL / SSL 等）。
          *
-         * @param string                 $cluster   逻辑集群名，业务侧 `produce*` / `subscribe` 用它引用
-         * @param array<string,string>   $config    librdkafka 配置，必须含 `bootstrap.servers`
-         * @param int|null               $timeoutMs IPC 超时；默认 5000
+         * @param string               $cluster   逻辑集群名，业务侧 `produce*` / `subscribe` 用它引用
+         * @param array<string,string> $config    librdkafka 配置，必须含 `bootstrap.servers`
+         * @param int|null             $timeoutMs IPC 超时；默认 5000
          *
          * @throws \Exception 集群名无 `bootstrap.servers` / IPC 失败
          */
-        public function registerCluster(string $cluster, array $config, ?int $timeoutMs = null): void {}
+        public function registerCluster(string $cluster, array $config, ?int $timeoutMs = null): void
+        {
+        }
 
         /**
          * 显式拉起 worker 进程（命中缓存时零开销直接返回）。
          * 业务里几乎不用主动调，第一次 produce / subscribe 会自动触发。
          */
-        public function ensureWorker(): void {}
+        public function ensureWorker(): void
+        {
+        }
 
         /**
          * Fire-and-forget 生产。**不等 broker ack**，吞吐量最高，无投递成功保证。
          *
-         * @param string                  $cluster
-         * @param string                  $topic
-         * @param string                  $key
-         * @param string                  $value
-         * @param array<string,string>    $headers     Kafka 消息头（关联数组，UTF-8）
-         * @param int|null                $partition   null = 由 librdkafka partitioner（key hash）决定
-         * @param int|null                $timestampMs null = 当前时间戳
+         * @param string               $cluster
+         * @param string               $topic
+         * @param string               $key
+         * @param string               $value
+         * @param array<string,string> $headers     Kafka 消息头（关联数组，UTF-8）
+         * @param int|null             $partition   null = 由 librdkafka partitioner（key hash）决定
+         * @param int|null             $timestampMs null = 当前时间戳
          */
         public function produceFnf(
             string $cluster,
@@ -76,8 +88,9 @@ namespace Hi\Kafka {
             string $value,
             array $headers = [],
             ?int $partition = null,
-            ?int $timestampMs = null
-        ): void {}
+            ?int $timestampMs = null,
+        ): void {
+        }
 
         /**
          * 同步生产，等 broker delivery report。
@@ -101,17 +114,18 @@ namespace Hi\Kafka {
             array $headers = [],
             ?int $partition = null,
             ?int $timestampMs = null,
-            ?int $timeoutMs = null
-        ): array {}
+            ?int $timeoutMs = null,
+        ): array {
+        }
 
         /**
          * Binary-safe F&F：key / value / header value 接受**任意字节**（NUL / 0xFF / 非 UTF-8）。
          * 用于 protobuf / msgpack / 加密 payload 等场景。
          *
-         * @param string   $key           PHP binary string
-         * @param string   $value         PHP binary string
-         * @param string[] $headerNames   header 名 UTF-8（Kafka 协议要求）
-         * @param string[] $headerValues  平行数组，每个元素是 binary string
+         * @param string   $key          PHP binary string
+         * @param string   $value        PHP binary string
+         * @param string[] $headerNames  header 名 UTF-8（Kafka 协议要求）
+         * @param string[] $headerValues 平行数组，每个元素是 binary string
          */
         public function produceFnfBin(
             string $cluster,
@@ -121,8 +135,9 @@ namespace Hi\Kafka {
             array $headerNames,
             array $headerValues,
             ?int $partition = null,
-            ?int $timestampMs = null
-        ): void {}
+            ?int $timestampMs = null,
+        ): void {
+        }
 
         /**
          * Binary-safe 同步生产。返回结构同 {@see produceSync()}。
@@ -141,16 +156,17 @@ namespace Hi\Kafka {
             array $headerValues,
             ?int $partition = null,
             ?int $timestampMs = null,
-            ?int $timeoutMs = null
-        ): array {}
+            ?int $timeoutMs = null,
+        ): array {
+        }
 
         /**
          * 订阅 topics 到 group。
          *
          * @param string                    $cluster
-         * @param string                    $groupId        Kafka consumer group
+         * @param string                    $groupId   Kafka consumer group
          * @param string[]                  $topics
-         * @param array<string,string>|null $config         librdkafka consumer 配置（auto.offset.reset / session.timeout.ms / isolation.level 等）
+         * @param array<string,string>|null $config    librdkafka consumer 配置（auto.offset.reset / session.timeout.ms / isolation.level 等）
          * @param int|null                  $timeoutMs
          *
          * @return int **virtual** subscription_id；worker 崩溃后自愈重订阅这个 id 不变
@@ -160,8 +176,9 @@ namespace Hi\Kafka {
             string $groupId,
             array $topics,
             ?array $config = null,
-            ?int $timeoutMs = null
-        ): int {}
+            ?int $timeoutMs = null,
+        ): int {
+        }
 
         /**
          * 拉一批消息。`timeoutMs=0` 非阻塞快照；否则 long-poll。
@@ -176,28 +193,39 @@ namespace Hi\Kafka {
          *     headers: array<string,string>,
          * }>
          */
-        public function poll(int $subscriptionId, int $maxMessages, int $timeoutMs): array {}
+        public function poll(int $subscriptionId, int $maxMessages, int $timeoutMs): array
+        {
+        }
 
-        /** 同步提交当前持有的 offsets */
-        public function commit(int $subscriptionId, ?int $timeoutMs = null): void {}
+        /**
+         * 同步提交当前持有的 offsets
+         */
+        public function commit(int $subscriptionId, ?int $timeoutMs = null): void
+        {
+        }
 
-        /** 退订（幂等）。worker 端 close consumer 走 spawn_blocking 不阻塞 tokio */
-        public function unsubscribe(int $subscriptionId): void {}
+        /**
+         * 退订（幂等）。worker 端 close consumer 走 spawn_blocking 不阻塞 tokio
+         */
+        public function unsubscribe(int $subscriptionId): void
+        {
+        }
 
         /**
          * 拉取 rebalance 事件队列。
          *
          * @return list<array{type: string, partitions?: list<array{topic: string, partition: int}>, message?: string}>
-         *         事件结构：
-         *         - `['type' => 'assign', 'partitions' => [...]]`
-         *         - `['type' => 'revoke', 'partitions' => [...]]`
-         *         - `['type' => 'error', 'message' => string]`
+         *                                                                                                              事件结构：
+         *                                                                                                              - `['type' => 'assign', 'partitions' => [...]]`
+         *                                                                                                              - `['type' => 'revoke', 'partitions' => [...]]`
+         *                                                                                                              - `['type' => 'error', 'message' => string]`
          */
         public function pollRebalanceEvents(
             int $subscriptionId,
             ?int $maxEvents = null,
-            ?int $timeoutMs = null
-        ): array {}
+            ?int $timeoutMs = null,
+        ): array {
+        }
 
         /**
          * 按 offset seek。三个**平行数组**，长度必须一致：
@@ -214,8 +242,9 @@ namespace Hi\Kafka {
             array $topics,
             array $partitions,
             array $offsets,
-            ?int $timeoutMs = null
-        ): void {}
+            ?int $timeoutMs = null,
+        ): void {
+        }
 
         /**
          * 按时间戳 seek（librdkafka `offsets_for_times` 解析后 seek 到对应 offset）。
@@ -229,8 +258,9 @@ namespace Hi\Kafka {
             int $timestampMs,
             array $topics,
             array $partitions,
-            ?int $timeoutMs = null
-        ): void {}
+            ?int $timeoutMs = null,
+        ): void {
+        }
 
         /**
          * 暂停一组 (topic, partition) 的 fetch；**不丢分区分配 / 不触发 rebalance**。
@@ -243,8 +273,9 @@ namespace Hi\Kafka {
             int $subscriptionId,
             array $topics,
             array $partitions,
-            ?int $timeoutMs = null
-        ): void {}
+            ?int $timeoutMs = null,
+        ): void {
+        }
 
         /**
          * 恢复被 {@see pause()} 暂停的分区，从上次 fetch 位置继续。
@@ -256,21 +287,32 @@ namespace Hi\Kafka {
             int $subscriptionId,
             array $topics,
             array $partitions,
-            ?int $timeoutMs = null
-        ): void {}
+            ?int $timeoutMs = null,
+        ): void {
+        }
 
         /**
          * 开启事务。集群配置必须含 `transactional.id`，每个 PHP 实例 / 节点唯一。
          *
          * @throws \Exception cluster 没启用事务 / 上一个事务未完成 / broker fencing
          */
-        public function beginTransaction(string $cluster, ?int $timeoutMs = null): void {}
+        public function beginTransaction(string $cluster, ?int $timeoutMs = null): void
+        {
+        }
 
-        /** 原子提交事务里所有 in-flight 消息 */
-        public function commitTransaction(string $cluster, ?int $timeoutMs = null): void {}
+        /**
+         * 原子提交事务里所有 in-flight 消息
+         */
+        public function commitTransaction(string $cluster, ?int $timeoutMs = null): void
+        {
+        }
 
-        /** 回滚事务，read_committed consumer 看不到这些消息 */
-        public function abortTransaction(string $cluster, ?int $timeoutMs = null): void {}
+        /**
+         * 回滚事务，read_committed consumer 看不到这些消息
+         */
+        public function abortTransaction(string $cluster, ?int $timeoutMs = null): void
+        {
+        }
 
         /**
          * **Exactly-Once Stream（KIP-447）**：把 consumer offsets 提交进当前事务，
@@ -296,8 +338,9 @@ namespace Hi\Kafka {
             array $topics,
             array $partitions,
             array $offsets,
-            ?int $timeoutMs = null
-        ): void {}
+            ?int $timeoutMs = null,
+        ): void {
+        }
 
         /**
          * 推送 SASL/OAUTHBEARER token 给指定集群。
@@ -305,11 +348,11 @@ namespace Hi\Kafka {
          *
          * 业务侧典型刷新策略：定时器每 `lifetime_ms - now - 5min` 刷一次；或监听 token rotate 事件。
          *
-         * @param string                $cluster
-         * @param string                $token          JWT / opaque token
-         * @param int                   $lifetimeMs     token 失效时间（unix epoch ms）
-         * @param string                $principalName  Kafka principal
-         * @param array<string,string>  $extensions     SASL extensions（预留，rdkafka 0.38 还没透传）
+         * @param string               $cluster
+         * @param string               $token         JWT / opaque token
+         * @param int                  $lifetimeMs    token 失效时间（unix epoch ms）
+         * @param string               $principalName Kafka principal
+         * @param array<string,string> $extensions    SASL extensions（预留，rdkafka 0.38 还没透传）
          */
         public function setOAuthBearerToken(
             string $cluster,
@@ -317,8 +360,9 @@ namespace Hi\Kafka {
             int $lifetimeMs,
             string $principalName,
             array $extensions = [],
-            ?int $timeoutMs = null
-        ): void {}
+            ?int $timeoutMs = null,
+        ): void {
+        }
     }
 
     /**
@@ -329,40 +373,92 @@ namespace Hi\Kafka {
      */
     final class SwooleClient
     {
-        public function __construct(string $socket = '/tmp/hi-kafka.sock', int $maxIdle = 16, float $connectTimeout = 1.0) {}
+        public function __construct(string $socket = '/tmp/hi-kafka.sock', int $maxIdle = 16, float $connectTimeout = 1.0)
+        {
+        }
 
-        public function registerCluster(string $cluster, array $config, int $timeoutMs = 5000): void {}
+        public function registerCluster(string $cluster, array $config, int $timeoutMs = 5000): void
+        {
+        }
 
         public function produceFnf(
-            string $cluster, string $topic, string $key, string $value,
-            ?array $headers = null, ?int $partition = null, ?int $timestampMs = null
-        ): void {}
+            string $cluster,
+            string $topic,
+            string $key,
+            string $value,
+            ?array $headers = null,
+            ?int $partition = null,
+            ?int $timestampMs = null,
+        ): void {
+        }
 
-        /** @return array{ok: bool, cid: int, partition?: int, offset?: int, code?: int, message?: string, retryable?: bool} */
+        /**
+         * @return array{ok: bool, cid: int, partition?: int, offset?: int, code?: int, message?: string, retryable?: bool}
+         */
         public function produceSync(
-            string $cluster, string $topic, string $key, string $value,
-            int $timeoutMs = 5000, ?array $headers = null,
-            ?int $partition = null, ?int $timestampMs = null
-        ): array {}
+            string $cluster,
+            string $topic,
+            string $key,
+            string $value,
+            int $timeoutMs = 5000,
+            ?array $headers = null,
+            ?int $partition = null,
+            ?int $timestampMs = null,
+        ): array {
+        }
 
-        public function subscribe(string $cluster, string $groupId, array $topics, ?array $config = null, int $timeoutMs = 5000): int {}
-        public function poll(int $subscriptionId, int $maxMessages, int $timeoutMs): array {}
-        public function commit(int $subscriptionId, int $timeoutMs = 5000): void {}
-        public function unsubscribe(int $subscriptionId): void {}
-        public function ensureWorker(): void {}
-        /** @return array{socket: string, max_idle: int, idle: int, created: int} */
-        public function stats(): array {}
+        public function subscribe(string $cluster, string $groupId, array $topics, ?array $config = null, int $timeoutMs = 5000): int
+        {
+        }
+        public function poll(int $subscriptionId, int $maxMessages, int $timeoutMs): array
+        {
+        }
+        public function commit(int $subscriptionId, int $timeoutMs = 5000): void
+        {
+        }
+        public function unsubscribe(int $subscriptionId): void
+        {
+        }
+        public function ensureWorker(): void
+        {
+        }
+        /**
+         * @return array{socket: string, max_idle: int, idle: int, created: int}
+         */
+        public function stats(): array
+        {
+        }
         // Phase 3.x（与 Client 对齐）
-        public function pause(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void {}
-        public function resume(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void {}
-        public function seek(int $subscriptionId, array $topics, array $partitions, array $offsets, int $timeoutMs = 10000): void {}
-        public function seekToTimestamp(int $subscriptionId, int $timestampMs, array $topics, array $partitions, int $timeoutMs = 15000): void {}
-        public function beginTransaction(string $cluster, int $timeoutMs = 30000): void {}
-        public function commitTransaction(string $cluster, int $timeoutMs = 30000): void {}
-        public function abortTransaction(string $cluster, int $timeoutMs = 30000): void {}
-        public function sendOffsetsToTransaction(string $producerCluster, int $subscriptionId, string $groupId, array $topics, array $partitions, array $offsets, int $timeoutMs = 30000): void {}
-        public function setOAuthBearerToken(string $cluster, string $token, int $lifetimeMs, string $principalName, array $extensions = [], int $timeoutMs = 5000): void {}
-        public function pollRebalanceEvents(int $subscriptionId, int $maxEvents = 100, int $timeoutMs = 5000): array {}
+        public function pause(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void
+        {
+        }
+        public function resume(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void
+        {
+        }
+        public function seek(int $subscriptionId, array $topics, array $partitions, array $offsets, int $timeoutMs = 10000): void
+        {
+        }
+        public function seekToTimestamp(int $subscriptionId, int $timestampMs, array $topics, array $partitions, int $timeoutMs = 15000): void
+        {
+        }
+        public function beginTransaction(string $cluster, int $timeoutMs = 30000): void
+        {
+        }
+        public function commitTransaction(string $cluster, int $timeoutMs = 30000): void
+        {
+        }
+        public function abortTransaction(string $cluster, int $timeoutMs = 30000): void
+        {
+        }
+        public function sendOffsetsToTransaction(string $producerCluster, int $subscriptionId, string $groupId, array $topics, array $partitions, array $offsets, int $timeoutMs = 30000): void
+        {
+        }
+        public function setOAuthBearerToken(string $cluster, string $token, int $lifetimeMs, string $principalName, array $extensions = [], int $timeoutMs = 5000): void
+        {
+        }
+        public function pollRebalanceEvents(int $subscriptionId, int $maxEvents = 100, int $timeoutMs = 5000): array
+        {
+        }
     }
 
     /**
@@ -371,40 +467,92 @@ namespace Hi\Kafka {
      */
     final class SwowClient
     {
-        public function __construct(string $socket = '/tmp/hi-kafka.sock', int $maxIdle = 16, int $connectTimeoutMs = 1000) {}
+        public function __construct(string $socket = '/tmp/hi-kafka.sock', int $maxIdle = 16, int $connectTimeoutMs = 1000)
+        {
+        }
 
-        public function registerCluster(string $cluster, array $config, int $timeoutMs = 5000): void {}
+        public function registerCluster(string $cluster, array $config, int $timeoutMs = 5000): void
+        {
+        }
 
         public function produceFnf(
-            string $cluster, string $topic, string $key, string $value,
-            ?array $headers = null, ?int $partition = null, ?int $timestampMs = null
-        ): void {}
+            string $cluster,
+            string $topic,
+            string $key,
+            string $value,
+            ?array $headers = null,
+            ?int $partition = null,
+            ?int $timestampMs = null,
+        ): void {
+        }
 
-        /** @return array{ok: bool, cid: int, partition?: int, offset?: int, code?: int, message?: string, retryable?: bool} */
+        /**
+         * @return array{ok: bool, cid: int, partition?: int, offset?: int, code?: int, message?: string, retryable?: bool}
+         */
         public function produceSync(
-            string $cluster, string $topic, string $key, string $value,
-            int $timeoutMs = 5000, ?array $headers = null,
-            ?int $partition = null, ?int $timestampMs = null
-        ): array {}
+            string $cluster,
+            string $topic,
+            string $key,
+            string $value,
+            int $timeoutMs = 5000,
+            ?array $headers = null,
+            ?int $partition = null,
+            ?int $timestampMs = null,
+        ): array {
+        }
 
-        public function subscribe(string $cluster, string $groupId, array $topics, ?array $config = null, int $timeoutMs = 5000): int {}
-        public function poll(int $subscriptionId, int $maxMessages, int $timeoutMs): array {}
-        public function commit(int $subscriptionId, int $timeoutMs = 5000): void {}
-        public function unsubscribe(int $subscriptionId): void {}
-        public function ensureWorker(): void {}
-        /** @return array{socket: string, max_idle: int, idle: int, created: int} */
-        public function stats(): array {}
+        public function subscribe(string $cluster, string $groupId, array $topics, ?array $config = null, int $timeoutMs = 5000): int
+        {
+        }
+        public function poll(int $subscriptionId, int $maxMessages, int $timeoutMs): array
+        {
+        }
+        public function commit(int $subscriptionId, int $timeoutMs = 5000): void
+        {
+        }
+        public function unsubscribe(int $subscriptionId): void
+        {
+        }
+        public function ensureWorker(): void
+        {
+        }
+        /**
+         * @return array{socket: string, max_idle: int, idle: int, created: int}
+         */
+        public function stats(): array
+        {
+        }
         // Phase 3.x（与 Client 对齐）
-        public function pause(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void {}
-        public function resume(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void {}
-        public function seek(int $subscriptionId, array $topics, array $partitions, array $offsets, int $timeoutMs = 10000): void {}
-        public function seekToTimestamp(int $subscriptionId, int $timestampMs, array $topics, array $partitions, int $timeoutMs = 15000): void {}
-        public function beginTransaction(string $cluster, int $timeoutMs = 30000): void {}
-        public function commitTransaction(string $cluster, int $timeoutMs = 30000): void {}
-        public function abortTransaction(string $cluster, int $timeoutMs = 30000): void {}
-        public function sendOffsetsToTransaction(string $producerCluster, int $subscriptionId, string $groupId, array $topics, array $partitions, array $offsets, int $timeoutMs = 30000): void {}
-        public function setOAuthBearerToken(string $cluster, string $token, int $lifetimeMs, string $principalName, array $extensions = [], int $timeoutMs = 5000): void {}
-        public function pollRebalanceEvents(int $subscriptionId, int $maxEvents = 100, int $timeoutMs = 5000): array {}
+        public function pause(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void
+        {
+        }
+        public function resume(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void
+        {
+        }
+        public function seek(int $subscriptionId, array $topics, array $partitions, array $offsets, int $timeoutMs = 10000): void
+        {
+        }
+        public function seekToTimestamp(int $subscriptionId, int $timestampMs, array $topics, array $partitions, int $timeoutMs = 15000): void
+        {
+        }
+        public function beginTransaction(string $cluster, int $timeoutMs = 30000): void
+        {
+        }
+        public function commitTransaction(string $cluster, int $timeoutMs = 30000): void
+        {
+        }
+        public function abortTransaction(string $cluster, int $timeoutMs = 30000): void
+        {
+        }
+        public function sendOffsetsToTransaction(string $producerCluster, int $subscriptionId, string $groupId, array $topics, array $partitions, array $offsets, int $timeoutMs = 30000): void
+        {
+        }
+        public function setOAuthBearerToken(string $cluster, string $token, int $lifetimeMs, string $principalName, array $extensions = [], int $timeoutMs = 5000): void
+        {
+        }
+        public function pollRebalanceEvents(int $subscriptionId, int $maxEvents = 100, int $timeoutMs = 5000): array
+        {
+        }
     }
 }
 
@@ -412,12 +560,16 @@ namespace {
     /**
      * 扩展版本号
      */
-    function hi_kafka_version(): string {}
+    function hi_kafka_version(): string
+    {
+    }
 
     /**
      * 显式启动 worker（如果还没在跑）。命中缓存时零开销。
      */
-    function hi_kafka_ensure_worker(?string $socket = null): void {}
+    function hi_kafka_ensure_worker(?string $socket = null): void
+    {
+    }
 
     /**
      * 注册或覆盖 Kafka 集群配置。全局函数版（不需要 Client 实例）。
@@ -428,8 +580,9 @@ namespace {
         string $cluster,
         array $config,
         ?string $socket = null,
-        ?int $timeoutMs = null
-    ): void {}
+        ?int $timeoutMs = null,
+    ): void {
+    }
 
     /**
      * Fire-and-forget 生产。全局函数版。
@@ -444,8 +597,9 @@ namespace {
         ?array $headers = null,
         ?int $partition = null,
         ?int $timestampMs = null,
-        ?string $socket = null
-    ): void {}
+        ?string $socket = null,
+    ): void {
+    }
 
     /**
      * 同步生产。
@@ -463,8 +617,9 @@ namespace {
         ?int $partition = null,
         ?int $timestampMs = null,
         ?int $timeoutMs = null,
-        ?string $socket = null
-    ): array {}
+        ?string $socket = null,
+    ): array {
+    }
 
     /**
      * 订阅。返回 virtual subscription_id。
@@ -478,8 +633,9 @@ namespace {
         array $topics,
         ?array $config = null,
         ?string $socket = null,
-        ?int $timeoutMs = null
-    ): int {}
+        ?int $timeoutMs = null,
+    ): int {
+    }
 
     /**
      * 拉一批消息。
@@ -494,15 +650,29 @@ namespace {
      *     headers: array<string,string>,
      * }>
      */
-    function hi_kafka_poll(int $subscriptionId, int $maxMessages, int $timeoutMs): array {}
+    function hi_kafka_poll(int $subscriptionId, int $maxMessages, int $timeoutMs): array
+    {
+    }
 
-    function hi_kafka_commit(int $subscriptionId, ?int $timeoutMs = null): void {}
-    function hi_kafka_unsubscribe(int $subscriptionId): void {}
+    function hi_kafka_commit(int $subscriptionId, ?int $timeoutMs = null): void
+    {
+    }
+    function hi_kafka_unsubscribe(int $subscriptionId): void
+    {
+    }
 
-    /** @internal 协程 driver 登记订阅，供进程退出时主动 unsubscribe + Goodbye */
-    function hi_kafka_track_subscription(int $subscriptionId, ?string $socket = null): void {}
-    /** @internal 与 hi_kafka_track_subscription 配对，driver 主动 unsubscribe 后注销 */
-    function hi_kafka_untrack_subscription(int $subscriptionId, ?string $socket = null): void {}
+    /**
+     * @internal 协程 driver 登记订阅，供进程退出时主动 unsubscribe + Goodbye
+     */
+    function hi_kafka_track_subscription(int $subscriptionId, ?string $socket = null): void
+    {
+    }
+    /**
+     * @internal 与 hi_kafka_track_subscription 配对，driver 主动 unsubscribe 后注销
+     */
+    function hi_kafka_untrack_subscription(int $subscriptionId, ?string $socket = null): void
+    {
+    }
 
     /**
      * 扩展端连接池统计（按 socket 路径分组）。
@@ -517,28 +687,36 @@ namespace {
      *     poisoned: int,
      * }>
      */
-    function hi_kafka_pool_stats(): array {}
+    function hi_kafka_pool_stats(): array
+    {
+    }
 
     /**
      * IPC 自动重试统计（worker 崩溃后的恢复次数）。
      *
      * @return array{attempts: int, successes: int, failures: int}
      */
-    function hi_kafka_retry_stats(): array {}
+    function hi_kafka_retry_stats(): array
+    {
+    }
 
     /**
      * Consumer 自动重订阅统计（worker 崩溃后的 virtual_id 自愈）。
      *
      * @return array{attempts: int, successes: int, failures: int}
      */
-    function hi_kafka_resubscribe_stats(): array {}
+    function hi_kafka_resubscribe_stats(): array
+    {
+    }
 
     /**
      * 当前 PHP 进程加载了哪些协程运行时（检测 `swoole_version` / `swow\version` 等）。
      *
      * @return list<string> 例如 `["blocking"]` 或 `["blocking", "swoole"]`
      */
-    function hi_kafka_runtime(): array {}
+    function hi_kafka_runtime(): array
+    {
+    }
 
     // ========================================================================
     // 低级协议编解码原语，给 PHP 协程 driver（SwooleClient / SwowClient）用。
@@ -547,31 +725,45 @@ namespace {
 
     /**
      * 全进程单调自增 correlation id
+     *
      * @internal
      */
-    function hi_kafka_next_cid(): int {}
+    function hi_kafka_next_cid(): int
+    {
+    }
 
     /**
      * 协议帧头长度（常量 13）
+     *
      * @internal
      */
-    function hi_kafka_header_len(): int {}
+    function hi_kafka_header_len(): int
+    {
+    }
 
     /**
      * 编一帧 HELLO 协议握手，返回完整 14B 帧字节
+     *
      * @internal
      */
-    function hi_kafka_encode_hello_frame(): string {}
+    function hi_kafka_encode_hello_frame(): string
+    {
+    }
 
     /**
      * 校验 HELLO RESP 完整帧（14B），版本不匹配或格式错误抛异常
+     *
      * @internal
      */
-    function hi_kafka_verify_hello_resp(string $bytes): void {}
+    function hi_kafka_verify_hello_resp(string $bytes): void
+    {
+    }
 
     /**
      * 编一帧 PRODUCE_FNF（fire-and-forget），返回完整帧字节
+     *
      * @param array<string,string>|null $headers
+     *
      * @internal
      */
     function hi_kafka_encode_fnf_frame(
@@ -581,13 +773,17 @@ namespace {
         string $value,
         ?array $headers = null,
         ?int $partition = null,
-        ?int $timestampMs = null
-    ): string {}
+        ?int $timestampMs = null,
+    ): string {
+    }
 
     /**
      * 编一帧 PRODUCE_REQ
+     *
      * @param array<string,string>|null $headers
+     *
      * @return array{cid: int, frame: string}
+     *
      * @internal
      */
     function hi_kafka_encode_req_frame(
@@ -597,64 +793,93 @@ namespace {
         string $value,
         ?array $headers = null,
         ?int $partition = null,
-        ?int $timestampMs = null
-    ): array {}
+        ?int $timestampMs = null,
+    ): array {
+    }
 
     /**
      * 解析 13B 帧头
+     *
      * @return array{kind: int, cid: int, payload_len: int}
+     *
      * @internal
      */
-    function hi_kafka_parse_header(string $bytes): array {}
+    function hi_kafka_parse_header(string $bytes): array
+    {
+    }
 
     /**
      * 解析 PRODUCE_RESP 完整帧
+     *
      * @return array{cid: int, ok: bool, partition?: int, offset?: int, code?: int, message?: string, retryable?: bool}
+     *
      * @internal
      */
-    function hi_kafka_decode_resp_frame(string $bytes): array {}
+    function hi_kafka_decode_resp_frame(string $bytes): array
+    {
+    }
 
     /**
      * 编一帧 SUBSCRIBE_REQ
-     * @param string[] $topics
+     *
+     * @param string[]                  $topics
      * @param array<string,string>|null $config
+     *
      * @return array{cid: int, frame: string}
+     *
      * @internal
      */
     function hi_kafka_encode_subscribe_frame(
         string $cluster,
         string $groupId,
         array $topics,
-        ?array $config = null
-    ): array {}
+        ?array $config = null,
+    ): array {
+    }
 
     /**
      * 编一帧 POLL_REQ
+     *
      * @return array{cid: int, frame: string}
+     *
      * @internal
      */
-    function hi_kafka_encode_poll_frame(int $subscriptionId, int $maxMessages, int $timeoutMs): array {}
+    function hi_kafka_encode_poll_frame(int $subscriptionId, int $maxMessages, int $timeoutMs): array
+    {
+    }
 
     /**
      * 编一帧 COMMIT_REQ
+     *
      * @return array{cid: int, frame: string}
+     *
      * @internal
      */
-    function hi_kafka_encode_commit_frame(int $subscriptionId): array {}
+    function hi_kafka_encode_commit_frame(int $subscriptionId): array
+    {
+    }
 
     /**
      * 编一帧 UNSUBSCRIBE
+     *
      * @internal
      */
-    function hi_kafka_encode_unsubscribe_frame(int $subscriptionId): string {}
+    function hi_kafka_encode_unsubscribe_frame(int $subscriptionId): string
+    {
+    }
 
     /**
      * 编一帧 REGISTER_CLUSTER_REQ
+     *
      * @param array<string,string> $config
+     *
      * @return array{cid: int, frame: string}
+     *
      * @internal
      */
-    function hi_kafka_encode_register_cluster_frame(string $cluster, array $config): array {}
+    function hi_kafka_encode_register_cluster_frame(string $cluster, array $config): array
+    {
+    }
 
     /**
      * 解析 consumer 响应帧（按 kind 分发）
@@ -668,9 +893,12 @@ namespace {
      *     events?: array,
      *     message?: string,
      * }
+     *
      * @internal
      */
-    function hi_kafka_decode_consumer_resp(string $bytes): array {}
+    function hi_kafka_decode_consumer_resp(string $bytes): array
+    {
+    }
 
     // ========================================================================
     // Phase 3.x REQ encoders（给 SwooleClient/SwowClient driver 用）
@@ -678,61 +906,94 @@ namespace {
 
     /**
      * 编一帧 PAUSE_RESUME_REQ。$op 0=Pause / 1=Resume；空数组 = 当前 assignment 全部。
+     *
      * @param string[] $topics
      * @param int[]    $partitions
+     *
      * @return array{cid:int, frame:string}
+     *
      * @internal
      */
-    function hi_kafka_encode_pause_resume_frame(int $subscriptionId, int $op, array $topics, array $partitions): array {}
+    function hi_kafka_encode_pause_resume_frame(int $subscriptionId, int $op, array $topics, array $partitions): array
+    {
+    }
 
     /**
      * 编一帧 SEEK_REQ（按 offset 模式）
+     *
      * @param string[] $topics
      * @param int[]    $partitions
      * @param int[]    $offsets
+     *
      * @return array{cid:int, frame:string}
+     *
      * @internal
      */
-    function hi_kafka_encode_seek_by_offset_frame(int $subscriptionId, array $topics, array $partitions, array $offsets): array {}
+    function hi_kafka_encode_seek_by_offset_frame(int $subscriptionId, array $topics, array $partitions, array $offsets): array
+    {
+    }
 
     /**
      * 编一帧 SEEK_REQ（按 timestamp 模式）
+     *
      * @param string[] $topics
      * @param int[]    $partitions
+     *
      * @return array{cid:int, frame:string}
+     *
      * @internal
      */
-    function hi_kafka_encode_seek_by_timestamp_frame(int $subscriptionId, int $timestampMs, array $topics, array $partitions): array {}
+    function hi_kafka_encode_seek_by_timestamp_frame(int $subscriptionId, int $timestampMs, array $topics, array $partitions): array
+    {
+    }
 
     /**
      * 编一帧 TXN_REQ。$op 0=Begin / 1=Commit / 2=Abort
+     *
      * @return array{cid:int, frame:string}
+     *
      * @internal
      */
-    function hi_kafka_encode_txn_frame(string $cluster, int $op): array {}
+    function hi_kafka_encode_txn_frame(string $cluster, int $op): array
+    {
+    }
 
     /**
      * 编一帧 SEND_OFFSETS_REQ（EOS stream）
+     *
      * @param string[] $topics
      * @param int[]    $partitions
      * @param int[]    $offsets
+     *
      * @return array{cid:int, frame:string}
+     *
      * @internal
      */
-    function hi_kafka_encode_send_offsets_frame(string $producerCluster, int $subscriptionId, string $groupId, array $topics, array $partitions, array $offsets): array {}
+    function hi_kafka_encode_send_offsets_frame(string $producerCluster, int $subscriptionId, string $groupId, array $topics, array $partitions, array $offsets): array
+    {
+    }
 
     /**
      * 编一帧 SET_OAUTH_BEARER_TOKEN_REQ
+     *
      * @param array<string,string>|null $extensions
+     *
      * @return array{cid:int, frame:string}
+     *
      * @internal
      */
-    function hi_kafka_encode_set_oauth_token_frame(string $cluster, string $token, int $lifetimeMs, string $principalName, ?array $extensions = null): array {}
+    function hi_kafka_encode_set_oauth_token_frame(string $cluster, string $token, int $lifetimeMs, string $principalName, ?array $extensions = null): array
+    {
+    }
 
     /**
      * 编一帧 POLL_REBALANCE_REQ
+     *
      * @return array{cid:int, frame:string}
+     *
      * @internal
      */
-    function hi_kafka_encode_poll_rebalance_frame(int $subscriptionId, int $maxEvents): array {}
+    function hi_kafka_encode_poll_rebalance_frame(int $subscriptionId, int $maxEvents): array
+    {
+    }
 }
