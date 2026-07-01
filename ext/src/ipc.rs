@@ -882,3 +882,223 @@ fn unsubscribe_once(socket: &str, subscription_id: u64) -> Result<(), IpcError> 
         Some(Duration::from_secs(1)),
     )
 }
+
+// ============================================================================
+// 单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn io(k: std::io::ErrorKind) -> IpcError {
+        IpcError::Io(std::io::Error::from(k))
+    }
+
+    // === should_invalidate 分类矩阵 =====================================
+
+    #[test]
+    fn test_should_invalidate_io_kinds_true() {
+        use std::io::ErrorKind::*;
+        for k in [BrokenPipe, ConnectionReset, ConnectionRefused, ConnectionAborted, UnexpectedEof]
+        {
+            assert!(
+                should_invalidate(&io(k)),
+                "{k:?} 应触发缓存失效"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_invalidate_io_kinds_false() {
+        use std::io::ErrorKind::*;
+        for k in [TimedOut, PermissionDenied, WouldBlock, Interrupted] {
+            assert!(
+                !should_invalidate(&io(k)),
+                "{k:?} 不应触发缓存失效——不是 worker 死"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_invalidate_worker_business_error() {
+        // worker 回的结构化业务错，worker 还活着 → 不 invalidate
+        let e = IpcError::Worker {
+            kind: ErrorKind::InvalidArgument,
+            retryable: false,
+            native_code: -1,
+            message: "bad arg".into(),
+        };
+        assert!(!should_invalidate(&e));
+    }
+
+    #[test]
+    fn test_should_invalidate_protocol_errors_false() {
+        // 协议层错误：worker 可能还活着，不 invalidate
+        assert!(!should_invalidate(&IpcError::Encode("x".into())));
+        assert!(!should_invalidate(&IpcError::DecodeResp("y".into())));
+        assert!(!should_invalidate(&IpcError::UnexpectedKind(
+            FrameType::Ping
+        )));
+        assert!(!should_invalidate(&IpcError::CidMismatch { sent: 1, got: 2 }));
+        assert!(!should_invalidate(&IpcError::Server("srv err".into())));
+    }
+
+    #[test]
+    fn test_should_invalidate_pool_error_true() {
+        // pool 拿不到连接大概率是 worker 挂了——两种 PoolError variant 都算
+        let e = IpcError::Pool(pool::PoolError::Connect {
+            socket: "/tmp/x.sock".into(),
+            source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        });
+        assert!(should_invalidate(&e));
+
+        let e2 = IpcError::Pool(pool::PoolError::Handshake {
+            socket: "/tmp/x.sock".into(),
+            reason: "bad hello".into(),
+        });
+        assert!(should_invalidate(&e2));
+    }
+
+    // === with_retry 分支 ================================================
+
+    fn snap() -> (u64, u64, u64) {
+        (
+            RETRY_ATTEMPTS.load(Ordering::Relaxed),
+            RETRY_SUCCESSES.load(Ordering::Relaxed),
+            RETRY_FAILURES.load(Ordering::Relaxed),
+        )
+    }
+
+    fn delta(before: (u64, u64, u64), after: (u64, u64, u64)) -> (u64, u64, u64) {
+        (after.0 - before.0, after.1 - before.1, after.2 - before.2)
+    }
+
+    /// RETRY_ATTEMPTS/SUCCESSES/FAILURES 是进程级全局；并发跑 with_retry 测试会互串。
+    /// 用这个 Mutex 把它们串起来，才能对 delta 做精确断言。
+    fn retry_lock() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GUARD
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn test_with_retry_success_first_try_no_counter_change() {
+        let _g = retry_lock();
+        let before = snap();
+        let ok: Result<i32, IpcError> = with_retry("/tmp/never-exists.sock", || Ok(42));
+        assert_eq!(ok.unwrap(), 42);
+        let d = delta(before, snap());
+        assert_eq!(d, (0, 0, 0), "首发即成功，计数器不动");
+    }
+
+    #[test]
+    fn test_with_retry_non_invalidatable_error_no_retry() {
+        let _g = retry_lock();
+        // Encode 错——非可 invalidate 类，op 只被调一次
+        let calls = Cell::new(0);
+        let before = snap();
+        let r: Result<(), IpcError> = with_retry("/tmp/no.sock", || {
+            calls.set(calls.get() + 1);
+            Err(IpcError::Encode("bad".into()))
+        });
+        assert!(matches!(r, Err(IpcError::Encode(_))));
+        assert_eq!(calls.get(), 1, "非可 invalidate 错误只调 op 一次");
+        let d = delta(before, snap());
+        assert_eq!(d, (0, 0, 0));
+    }
+
+    #[test]
+    fn test_with_retry_invalidatable_then_success_bumps_successes() {
+        let _g = retry_lock();
+        // 第一次 BrokenPipe，第二次 Ok
+        let calls = Cell::new(0);
+        let before = snap();
+        let r = with_retry("/tmp/ipc-test-retry-ok.sock", || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(io(std::io::ErrorKind::BrokenPipe))
+            } else {
+                Ok(1)
+            }
+        });
+        assert_eq!(r.unwrap(), 1);
+        assert_eq!(calls.get(), 2, "invalidatable 错误后应重试一次");
+        let d = delta(before, snap());
+        assert_eq!(d, (1, 1, 0), "attempts+1, successes+1, failures 不动");
+    }
+
+    #[test]
+    fn test_with_retry_invalidatable_twice_bumps_failures() {
+        let _g = retry_lock();
+        // 两次都失败——attempts+1, failures+1, successes 不动
+        let calls = Cell::new(0);
+        let before = snap();
+        let r: Result<(), IpcError> = with_retry("/tmp/ipc-test-retry-fail.sock", || {
+            calls.set(calls.get() + 1);
+            Err(io(std::io::ErrorKind::ConnectionReset))
+        });
+        assert!(r.is_err());
+        assert_eq!(calls.get(), 2, "第二次仍失败后不再重试");
+        let d = delta(before, snap());
+        assert_eq!(d, (1, 0, 1));
+    }
+
+    // === next_cid / retry_stats ==========================================
+
+    #[test]
+    fn test_next_cid_monotonic() {
+        let a = next_cid();
+        let b = next_cid();
+        let c = next_cid();
+        assert!(a < b && b < c);
+    }
+
+    #[test]
+    fn test_retry_stats_snapshot() {
+        // retry_stats() 只做原子读，值必须与直接读一致
+        let direct = (
+            RETRY_ATTEMPTS.load(Ordering::Relaxed),
+            RETRY_SUCCESSES.load(Ordering::Relaxed),
+            RETRY_FAILURES.load(Ordering::Relaxed),
+        );
+        let s = retry_stats();
+        assert_eq!(s.attempts, direct.0);
+        assert_eq!(s.successes, direct.1);
+        assert_eq!(s.failures, direct.2);
+    }
+
+    // === encode_produce_payload_bin ======================================
+
+    #[test]
+    fn test_encode_produce_payload_binary_safe() {
+        // key/value 含 null 字节应该被完整编码进去
+        let opts = ProduceOptions {
+            headers: vec![],
+            partition: -1,
+            timestamp_ms: -1,
+        };
+        let key = b"k\x00ey";
+        let value = b"v\x00al\xff";
+        let payload = encode_produce_payload_bin("c", "t", key, value, &opts).unwrap();
+        // payload 内应能找到原始字节序列
+        assert!(payload.iter().any(|&b| b == 0x00), "null 字节被保留");
+        assert!(payload.iter().any(|&b| b == 0xff), "0xff 字节被保留");
+    }
+
+    #[test]
+    fn test_encode_produce_payload_headers_preserved() {
+        let opts = ProduceOptions {
+            headers: vec![("k1".into(), bytes::Bytes::from_static(b"v1"))],
+            partition: 0,
+            timestamp_ms: 12345,
+        };
+        let payload = encode_produce_payload("cluster", "topic", "k", "v", &opts).unwrap();
+        // header key 字面量应能在 payload 里找到
+        let s = String::from_utf8_lossy(&payload);
+        assert!(s.contains("k1"), "header 键应被序列化");
+    }
+}

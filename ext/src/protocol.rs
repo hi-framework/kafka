@@ -632,6 +632,10 @@ pub fn parse_consumer_resp_frame(bytes: &[u8]) -> anyhow::Result<ConsumerResp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hi_kafka_proto::{DeliveryAck, DeliveryErr, ErrorKind};
+    use bytes::BufMut;
+
+    // === HELLO / Goodbye / 通用 header ==================================
 
     #[test]
     fn test_fnf_frame_roundtrip_via_parse_header() {
@@ -646,5 +650,419 @@ mod tests {
         let (cid1, _) = build_req_frame("c", "t", b"k", b"v", vec![], -1, -1).unwrap();
         let (cid2, _) = build_req_frame("c", "t", b"k", b"v", vec![], -1, -1).unwrap();
         assert!(cid2 > cid1);
+    }
+
+    #[test]
+    fn test_hello_frame_shape() {
+        let bytes = build_hello_frame().unwrap();
+        // 13B header + 1B payload (PROTOCOL_MAJOR)
+        assert_eq!(bytes.len(), HEADER_LEN + 1);
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::Hello as u8);
+        assert_eq!(h.cid, 0, "HELLO 帧 cid 固定为 0");
+        assert_eq!(h.payload_len, 1);
+    }
+
+    #[test]
+    fn test_hello_resp_ok() {
+        // 构造一个 major=PROTOCOL_MAJOR 的完整 HELLO RESP 帧
+        let bytes = encode_test_hello_resp(PROTOCOL_MAJOR);
+        assert!(parse_hello_resp(&bytes).is_ok());
+    }
+
+    #[test]
+    fn test_hello_resp_version_mismatch() {
+        let wrong = PROTOCOL_MAJOR.wrapping_add(1);
+        let bytes = encode_test_hello_resp(wrong);
+        let err = parse_hello_resp(&bytes).unwrap_err().to_string();
+        assert!(err.contains("PROTOCOL_MAJOR mismatch"));
+    }
+
+    #[test]
+    fn test_hello_resp_wrong_kind() {
+        // 用 Ping 帧充当 HELLO RESP 应该被拒
+        let mut frame = BytesMut::new();
+        encode_frame(FrameType::Ping, 0, &[], &mut frame).unwrap();
+        let err = parse_hello_resp(&frame).unwrap_err().to_string();
+        assert!(err.contains("expected HELLO RESP"));
+    }
+
+    #[test]
+    fn test_hello_resp_too_short() {
+        // 只给 12 字节，不足 header 长度
+        let err = parse_hello_resp(&[0u8; 12]).unwrap_err().to_string();
+        assert!(err.contains("too short"));
+    }
+
+    #[test]
+    fn test_goodbye_frame_shape() {
+        let bytes = build_goodbye_frame().unwrap();
+        assert_eq!(bytes.len(), HEADER_LEN, "Goodbye 无 payload");
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::Goodbye as u8);
+        assert_eq!(h.cid, 0, "Goodbye 是 fire-and-forget，cid=0");
+        assert_eq!(h.payload_len, 0);
+    }
+
+    #[test]
+    fn test_unsubscribe_frame_shape_and_cid() {
+        let bytes = build_unsubscribe_frame(42).unwrap();
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::Unsubscribe as u8);
+        assert_eq!(h.cid, 0, "Unsubscribe 是 fire-and-forget，cid=0");
+        // payload = UnsubscribeReq encoded (subscription_id = u64)
+        assert_eq!(h.payload_len as usize, 8);
+    }
+
+    #[test]
+    fn test_parse_header_too_short() {
+        // 12 字节 < 13 字节 header
+        let err = parse_header_only(&[0u8; 12])
+            .map(|_| ())
+            .err()
+            .expect("should error")
+            .to_string();
+        assert!(err.contains("too short"));
+    }
+
+    #[test]
+    fn test_next_cid_monotonic_batch() {
+        // 连续 100 次分配，严格单调
+        let mut prev = next_cid();
+        for _ in 0..100 {
+            let c = next_cid();
+            assert!(c > prev);
+            prev = c;
+        }
+    }
+
+    // === Consumer REQ 编帧 ==============================================
+
+    #[test]
+    fn test_subscribe_frame_header() {
+        let (cid, bytes) =
+            build_subscribe_frame("c", "g", vec!["t1".into(), "t2".into()], vec![]).unwrap();
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::SubscribeReq as u8);
+        assert_eq!(h.cid, cid);
+        assert!(h.cid > 0);
+    }
+
+    #[test]
+    fn test_poll_frame_header() {
+        let (cid, bytes) = build_poll_frame(7, 100, 500).unwrap();
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::PollReq as u8);
+        assert_eq!(h.cid, cid);
+    }
+
+    #[test]
+    fn test_commit_frame_header() {
+        let (cid, bytes) = build_commit_frame(7).unwrap();
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::CommitReq as u8);
+        assert_eq!(h.cid, cid);
+    }
+
+    #[test]
+    fn test_register_cluster_frame_header() {
+        let (cid, bytes) = build_register_cluster_frame(
+            "main",
+            vec![("bootstrap.servers".into(), "kafka:9092".into())],
+        )
+        .unwrap();
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::RegisterClusterReq as u8);
+        assert_eq!(h.cid, cid);
+    }
+
+    #[test]
+    fn test_pause_resume_frame_pause_and_resume() {
+        let (_, pause_bytes) = build_pause_resume_frame(
+            1,
+            PauseResumeOp::Pause,
+            vec![("t".into(), 0), ("t".into(), 1)],
+        )
+        .unwrap();
+        let (_, resume_bytes) =
+            build_pause_resume_frame(1, PauseResumeOp::Resume, vec![]).unwrap();
+        let ph = parse_header_only(&pause_bytes).unwrap();
+        let rh = parse_header_only(&resume_bytes).unwrap();
+        assert_eq!(ph.kind_byte, FrameType::PauseResumeReq as u8);
+        assert_eq!(rh.kind_byte, FrameType::PauseResumeReq as u8);
+        // Resume 空 partitions payload 应比 Pause 有 2 分区的短
+        assert!(rh.payload_len < ph.payload_len);
+    }
+
+    #[test]
+    fn test_seek_by_offset_frame() {
+        let (_, bytes) = build_seek_by_offset_frame(1, vec![("t".into(), 0, 42)]).unwrap();
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::SeekReq as u8);
+    }
+
+    #[test]
+    fn test_seek_by_timestamp_frame() {
+        let (_, bytes) =
+            build_seek_by_timestamp_frame(1, 1_700_000_000_000, vec![("t".into(), 0)]).unwrap();
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::SeekReq as u8);
+    }
+
+    #[test]
+    fn test_txn_frame_variants() {
+        for op in [TxnOp::Begin, TxnOp::Commit, TxnOp::Abort] {
+            let (_, bytes) = build_txn_frame("main", op).unwrap();
+            let h = parse_header_only(&bytes).unwrap();
+            assert_eq!(h.kind_byte, FrameType::TxnReq as u8);
+        }
+    }
+
+    #[test]
+    fn test_send_offsets_frame_header() {
+        let (_, bytes) =
+            build_send_offsets_frame("prod", 42, "grp", vec![("t".into(), 0, 100)]).unwrap();
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::SendOffsetsReq as u8);
+    }
+
+    #[test]
+    fn test_set_oauth_token_frame_header() {
+        let (_, bytes) = build_set_oauth_token_frame(
+            "main",
+            "eyJ.token",
+            60_000,
+            "svc-account",
+            vec![("scope".into(), "read".into())],
+        )
+        .unwrap();
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::SetOAuthBearerTokenReq as u8);
+    }
+
+    #[test]
+    fn test_poll_rebalance_frame_header() {
+        let (_, bytes) = build_poll_rebalance_frame(1, 32).unwrap();
+        let h = parse_header_only(&bytes).unwrap();
+        assert_eq!(h.kind_byte, FrameType::PollRebalanceReq as u8);
+    }
+
+    // === Producer / Error 响应解析 =======================================
+
+    #[test]
+    fn test_parse_resp_frame_produce_ok() {
+        let cid = 123;
+        let bytes = encode_test_produce_resp(
+            cid,
+            ProduceResp::Ok(DeliveryAck {
+                partition: 2,
+                offset: 999,
+            }),
+        );
+        match parse_resp_frame(&bytes).unwrap() {
+            ParsedFrame::Resp {
+                cid: got_cid,
+                resp: ProduceResp::Ok(ok),
+            } => {
+                assert_eq!(got_cid, cid);
+                assert_eq!(ok.partition, 2);
+                assert_eq!(ok.offset, 999);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_resp_frame_produce_err() {
+        let cid = 7;
+        let bytes = encode_test_produce_resp(
+            cid,
+            ProduceResp::Err(DeliveryErr {
+                code: 42,
+                message: "backend fail".into(),
+                retryable: true,
+            }),
+        );
+        match parse_resp_frame(&bytes).unwrap() {
+            ParsedFrame::Resp {
+                resp: ProduceResp::Err(e),
+                ..
+            } => {
+                assert_eq!(e.code, 42);
+                assert!(e.retryable);
+                assert_eq!(e.message, "backend fail");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_resp_frame_other_kind_passthrough() {
+        // 非 ProduceResp 帧应该走 Other 分支，不 panic
+        let mut frame = BytesMut::new();
+        encode_frame(FrameType::Ping, 555, &[], &mut frame).unwrap();
+        match parse_resp_frame(&frame).unwrap() {
+            ParsedFrame::Other { .. } => {}
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_error_frame_roundtrip() {
+        let er = ErrorResp {
+            kind: ErrorKind::ClusterNotRegistered,
+            retryable: false,
+            native_code: -1,
+            message: "cluster 'nope' not registered".into(),
+        };
+        let mut payload = BytesMut::new();
+        er.encode(&mut payload).unwrap();
+        let mut frame = BytesMut::new();
+        encode_frame(FrameType::Error, 99, &payload, &mut frame).unwrap();
+
+        let parsed = parse_error_frame(&frame).unwrap();
+        assert_eq!(parsed.kind, ErrorKind::ClusterNotRegistered.as_u16());
+        assert_eq!(parsed.kind_name, ErrorKind::ClusterNotRegistered.as_str());
+        assert!(!parsed.retryable);
+        assert_eq!(parsed.native_code, -1);
+        assert_eq!(parsed.message, "cluster 'nope' not registered");
+    }
+
+    #[test]
+    fn test_parse_error_frame_rejects_non_error_kind() {
+        let mut frame = BytesMut::new();
+        encode_frame(FrameType::Ping, 0, &[], &mut frame).unwrap();
+        // 用 map_err 转成 String，避开 ParsedError 未 impl Debug 的问题
+        let err = parse_error_frame(&frame)
+            .map(|_| ())
+            .err()
+            .expect("should error")
+            .to_string();
+        assert!(err.contains("expected Error frame"));
+    }
+
+    // === Consumer RESP 解析 =============================================
+
+    #[test]
+    fn test_parse_consumer_resp_subscribe_ok() {
+        let bytes = encode_test_consumer_resp(
+            FrameType::SubscribeResp,
+            11,
+            SubscribeResp::Ok {
+                subscription_id: 777,
+            },
+        );
+        match parse_consumer_resp_frame(&bytes).unwrap() {
+            ConsumerResp::SubscribeOk {
+                cid,
+                subscription_id,
+            } => {
+                assert_eq!(cid, 11);
+                assert_eq!(subscription_id, 777);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_consumer_resp_commit_err() {
+        let bytes = encode_test_consumer_resp(
+            FrameType::CommitResp,
+            12,
+            CommitResp::Err {
+                message: "coord unavailable".into(),
+            },
+        );
+        match parse_consumer_resp_frame(&bytes).unwrap() {
+            ConsumerResp::CommitErr { cid, message } => {
+                assert_eq!(cid, 12);
+                assert_eq!(message, "coord unavailable");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_consumer_resp_txn_ok() {
+        let bytes =
+            encode_test_consumer_resp(FrameType::TxnResp, 13, TxnResp::Ok);
+        match parse_consumer_resp_frame(&bytes).unwrap() {
+            ConsumerResp::TxnOk { cid } => assert_eq!(cid, 13),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_consumer_resp_unexpected_kind() {
+        // 用 Ping 冒充 consumer resp
+        let mut frame = BytesMut::new();
+        encode_frame(FrameType::Ping, 0, &[], &mut frame).unwrap();
+        let err = parse_consumer_resp_frame(&frame).unwrap_err().to_string();
+        assert!(err.contains("unexpected consumer frame kind"));
+    }
+
+    #[test]
+    fn test_parse_consumer_resp_truncated_payload() {
+        // 谎报 payload_len，实际字节不够
+        let mut header = BytesMut::new();
+        header.extend_from_slice(&100u32.to_be_bytes()); // payload_len = 100
+        header.put_u8(FrameType::SubscribeResp as u8);
+        header.extend_from_slice(&1u64.to_be_bytes()); // cid
+        // 只带 5 字节 payload
+        header.extend_from_slice(&[0u8; 5]);
+        let err = parse_consumer_resp_frame(&header).unwrap_err().to_string();
+        assert!(err.contains("truncated"));
+    }
+
+    // === 辅助编码函数 ====================================================
+    //
+    // 这些函数**只在测试内**——扩展运行时不需要往对端方向编响应帧，
+    // 但为了 roundtrip 断言，我们在本地"模拟" worker 侧构造 resp。
+
+    fn encode_test_hello_resp(major: u8) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        HelloResp { major }.encode(&mut payload).unwrap();
+        let mut frame = BytesMut::new();
+        encode_frame(FrameType::Hello, 0, &payload, &mut frame).unwrap();
+        frame.to_vec()
+    }
+
+    fn encode_test_produce_resp(cid: u64, resp: ProduceResp) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        resp.encode(&mut payload).unwrap();
+        let mut frame = BytesMut::new();
+        encode_frame(FrameType::ProduceResp, cid, &payload, &mut frame).unwrap();
+        frame.to_vec()
+    }
+
+    fn encode_test_consumer_resp<F>(kind: FrameType, cid: u64, resp: F) -> Vec<u8>
+    where
+        F: EncodeToBuf,
+    {
+        let mut payload = BytesMut::new();
+        resp.encode_to(&mut payload);
+        let mut frame = BytesMut::new();
+        encode_frame(kind, cid, &payload, &mut frame).unwrap();
+        frame.to_vec()
+    }
+
+    /// 让不同 Resp 类型共享编码入口（避免在测试里写 3 个重复 helper）。
+    trait EncodeToBuf {
+        fn encode_to(&self, buf: &mut BytesMut);
+    }
+    impl EncodeToBuf for SubscribeResp {
+        fn encode_to(&self, buf: &mut BytesMut) {
+            self.encode(buf).unwrap();
+        }
+    }
+    impl EncodeToBuf for CommitResp {
+        fn encode_to(&self, buf: &mut BytesMut) {
+            self.encode(buf).unwrap();
+        }
+    }
+    impl EncodeToBuf for TxnResp {
+        fn encode_to(&self, buf: &mut BytesMut) {
+            self.encode(buf).unwrap();
+        }
     }
 }

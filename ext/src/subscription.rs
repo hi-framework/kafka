@@ -261,3 +261,212 @@ pub fn drain_real_ids_for_socket(socket: &str) -> Vec<u64> {
     }
     real_ids
 }
+
+// ============================================================================
+// 单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试专用：合成一个虚拟订阅项塞进注册表，返回分配的 virtual_id。
+    /// 不走 ipc::subscribe，避免依赖真 worker。
+    fn insert_test_entry(socket: &str, cluster: &str, real_id: u64) -> u64 {
+        let virt = NEXT_VIRTUAL.fetch_add(1, Ordering::Relaxed);
+        registry().lock().unwrap().insert(
+            virt,
+            SubscriptionEntry {
+                socket: PathBuf::from(socket),
+                cluster: cluster.into(),
+                group_id: "g".into(),
+                topics: vec!["t".into()],
+                config: vec![],
+                real_id,
+                lock: std::sync::Arc::new(Mutex::new(())),
+            },
+        );
+        virt
+    }
+
+    fn remove_test_entry(vid: u64) {
+        registry().lock().unwrap().remove(&vid);
+    }
+
+    // === is_subscription_gone ===========================================
+
+    #[test]
+    fn test_is_subscription_gone_matches_subscription_not_found() {
+        let e = IpcError::Worker {
+            kind: ErrorKind::SubscriptionNotFound,
+            retryable: false,
+            native_code: 0,
+            message: "gone".into(),
+        };
+        assert!(is_subscription_gone(&e));
+    }
+
+    #[test]
+    fn test_is_subscription_gone_rejects_other_worker_kinds() {
+        for kind in [
+            ErrorKind::InvalidArgument,
+            ErrorKind::ClusterNotRegistered,
+            ErrorKind::BrokerRetryable,
+            ErrorKind::WorkerDraining,
+        ] {
+            let e = IpcError::Worker {
+                kind,
+                retryable: false,
+                native_code: 0,
+                message: "".into(),
+            };
+            assert!(
+                !is_subscription_gone(&e),
+                "{kind:?} 不应触发 resubscribe"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_subscription_gone_rejects_non_worker_variants() {
+        assert!(!is_subscription_gone(&IpcError::Server("srv".into())));
+        assert!(!is_subscription_gone(&IpcError::Encode("enc".into())));
+        assert!(!is_subscription_gone(&IpcError::Io(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        ))));
+    }
+
+    // === virtual_id 单调 =================================================
+
+    #[test]
+    fn test_virtual_id_monotonic_via_insert() {
+        // 直接调 insert helper，绕开 ipc；观察 virtual_id 严格递增
+        let v1 = insert_test_entry("/tmp/subs-mono-1.sock", "c", 10);
+        let v2 = insert_test_entry("/tmp/subs-mono-1.sock", "c", 11);
+        let v3 = insert_test_entry("/tmp/subs-mono-1.sock", "c", 12);
+        assert!(v1 < v2 && v2 < v3);
+        remove_test_entry(v1);
+        remove_test_entry(v2);
+        remove_test_entry(v3);
+    }
+
+    // === unsubscribe 幂等 ================================================
+
+    #[test]
+    fn test_unsubscribe_unknown_id_is_ok() {
+        // 不在 registry 里 → 直接 Ok，不触发 ipc（否则会 spawn 试图连接不存在的 socket）
+        let never_used = u64::MAX / 2;
+        assert!(registry()
+            .lock()
+            .unwrap()
+            .get(&never_used)
+            .is_none());
+        assert!(unsubscribe(never_used).is_ok());
+    }
+
+    // === with_resubscribe 未知 virtual_id ================================
+
+    #[test]
+    fn test_with_resubscribe_unknown_id_returns_server_error() {
+        let called = std::cell::Cell::new(false);
+        let never_used = u64::MAX / 2 + 7;
+        let r: Result<(), IpcError> = with_resubscribe(never_used, |_| {
+            called.set(true);
+            Ok(())
+        });
+        assert!(!called.get(), "未注册的 virtual_id 不应调用 op");
+        match r {
+            Err(IpcError::Server(msg)) => assert!(msg.contains("not found")),
+            other => panic!("expected Server err, got {other:?}"),
+        }
+    }
+
+    // === with_resubscribe 首次成功 =======================================
+
+    #[test]
+    fn test_with_resubscribe_first_try_success() {
+        let vid = insert_test_entry("/tmp/subs-succ.sock", "c", 42);
+        let seen = std::cell::Cell::new(0u64);
+        let r = with_resubscribe(vid, |entry| {
+            seen.set(entry.real_id);
+            Ok::<u64, IpcError>(entry.real_id + 1000)
+        });
+        assert_eq!(r.unwrap(), 1042);
+        assert_eq!(seen.get(), 42, "op 收到当前 real_id");
+        remove_test_entry(vid);
+    }
+
+    // === with_resubscribe 非 gone 错误直接透传 ============================
+
+    #[test]
+    fn test_with_resubscribe_non_gone_error_no_resubscribe() {
+        let vid = insert_test_entry("/tmp/subs-passthrough.sock", "c", 42);
+        let calls = std::cell::Cell::new(0);
+        let r: Result<(), IpcError> = with_resubscribe(vid, |_| {
+            calls.set(calls.get() + 1);
+            Err(IpcError::Server("business".into()))
+        });
+        assert_eq!(calls.get(), 1, "非 gone 错误只调 op 一次");
+        assert!(matches!(r, Err(IpcError::Server(_))));
+        remove_test_entry(vid);
+    }
+
+    // === 注册表辅助方法 ===================================================
+
+    #[test]
+    fn test_registered_count_reflects_registry() {
+        let before = registered_count();
+        let v1 = insert_test_entry("/tmp/subs-count-1.sock", "c", 1);
+        let v2 = insert_test_entry("/tmp/subs-count-2.sock", "c", 2);
+        assert_eq!(registered_count(), before + 2);
+        remove_test_entry(v1);
+        remove_test_entry(v2);
+        assert_eq!(registered_count(), before);
+    }
+
+    #[test]
+    fn test_known_sockets_returns_distinct() {
+        // 同 socket 插两条应只出现一次
+        let sock = "/tmp/subs-known-abc.sock";
+        let v1 = insert_test_entry(sock, "c", 1);
+        let v2 = insert_test_entry(sock, "c", 2);
+        let socks = known_sockets();
+        let count = socks.iter().filter(|s| s.as_str() == sock).count();
+        assert_eq!(count, 1, "同 socket 应去重");
+        remove_test_entry(v1);
+        remove_test_entry(v2);
+    }
+
+    #[test]
+    fn test_drain_real_ids_removes_only_matching_socket() {
+        let sock_a = "/tmp/subs-drain-a.sock";
+        let sock_b = "/tmp/subs-drain-b.sock";
+        let a1 = insert_test_entry(sock_a, "c", 100);
+        let a2 = insert_test_entry(sock_a, "c", 101);
+        let b1 = insert_test_entry(sock_b, "c", 200);
+
+        let mut drained = drain_real_ids_for_socket(sock_a);
+        drained.sort();
+        assert_eq!(drained, vec![100, 101]);
+        // sock_a 上的都被移除，sock_b 还在
+        assert!(registry().lock().unwrap().get(&a1).is_none());
+        assert!(registry().lock().unwrap().get(&a2).is_none());
+        assert!(registry().lock().unwrap().get(&b1).is_some());
+        remove_test_entry(b1);
+    }
+
+    // === resubscribe_stats 快照 ==========================================
+
+    #[test]
+    fn test_resubscribe_stats_snapshot() {
+        let direct = (
+            RESUB_ATTEMPTS.load(Ordering::Relaxed),
+            RESUB_SUCCESSES.load(Ordering::Relaxed),
+            RESUB_FAILURES.load(Ordering::Relaxed),
+        );
+        let s = resubscribe_stats();
+        assert_eq!(s.attempts, direct.0);
+        assert_eq!(s.successes, direct.1);
+        assert_eq!(s.failures, direct.2);
+    }
+}
